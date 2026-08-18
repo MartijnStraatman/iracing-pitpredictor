@@ -11,6 +11,33 @@ services:
       DEMO: ${DEMO:-}                      # 1 = self-generating sample race
     volumes:
       - pitwall-data:/data
+    networks:
+      - internal
+
+  nginx:
+    image: nginx:alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+    depends_on:
+      pitwall:
+        condition: service_healthy
+      # grafana:
+      #   condition: service_started
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - internal
 
 volumes:
   pitwall-data:
+
+networks:
+  internal:
