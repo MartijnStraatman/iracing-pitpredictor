@@ -12,3 +12,5 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+
+relay/.DS_Store
