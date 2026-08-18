@@ -180,7 +180,13 @@ async def health():
 @app.get("/")
 async def index(request: Request):
     _check_viewer(request)
-    return FileResponse(STATIC_DIR / "index.html")
+    # no-cache = revalidate every load (the ETag makes that a cheap 304).
+    # Without it browsers fall back to heuristic freshness and phones can sit
+    # on a stale dashboard for hours -- exactly when you push a fix mid-race.
+    return FileResponse(
+        STATIC_DIR / "index.html",
+        headers={"Cache-Control": "no-cache, must-revalidate"},
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,26 @@
+[project]
+name = "pitwall-client"
+version = "0.1.0"
+description = "PitWall telemetry client: iRacing pit stop prediction engine + live runner"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+
+# The engine (pit_prediction.py) is stdlib-only by design and must stay that
+# way. pyirsdk is the runner's only runtime dep and is Windows-only, so it is
+# installed by marker: on Linux/macOS the environment resolves without it and
+# `--demo` still exercises the real engine.
+dependencies = [
+    "pyirsdk>=1.3.6,<2; sys_platform == 'win32'",
+]
+
+[project.scripts]
+pit-predictor = "run_pit_predictor:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# Flat modules, not a package directory — list them explicitly.
+[tool.hatch.build.targets.wheel]
+sources = ["."]
+only-include = ["pit_prediction.py", "run_pit_predictor.py"]
