@@ -195,6 +195,8 @@ class IRacingSource:
                 "CarIdxLap": list(self.ir["CarIdxLap"] or []),
                 "CarIdxLastLapTime": list(self.ir["CarIdxLastLapTime"] or []),
                 "CarIdxLapDistPct": list(self.ir["CarIdxLapDistPct"] or []),
+                "CarIdxPosition": list(self.ir["CarIdxPosition"] or []),
+                "CarIdxClassPosition": list(self.ir["CarIdxClassPosition"] or []),
                 "SessionFlags": self.ir["SessionFlags"] or 0,
                 "SessionTimeRemain": self.ir["SessionTimeRemain"],
                 "SessionNum": self.ir["SessionNum"],
@@ -290,12 +292,21 @@ class DemoSource:
             surface.append(TRK_IN_PIT_STALL if in_stall else TRK_ON_TRACK)
             lap_arr.append(min(lap, car["pit_on_lap"]) if in_window else lap)
             last.append(car["lap_time"] + (hash(lap) % 10) / 10)
+        dist = [(sim_t % c["lap_time"]) / c["lap_time"] for c in self.cars]
+        # race order = laps completed + fraction of the current lap, so the
+        # demo tower actually shuffles as the faster cars pull away.
+        order = sorted(range(len(self.cars)), key=lambda i: -(lap_arr[i] + dist[i]))
+        positions = [0] * len(self.cars)
+        for rank, i in enumerate(order):
+            positions[i] = rank + 1
         return {
             "CarIdxOnPitRoad": on_pit,
             "CarIdxTrackSurface": surface,
             "CarIdxLap": lap_arr,
             "CarIdxLastLapTime": last,
-            "CarIdxLapDistPct": [(sim_t % c["lap_time"]) / c["lap_time"] for c in self.cars],
+            "CarIdxLapDistPct": dist,
+            "CarIdxPosition": positions,
+            "CarIdxClassPosition": positions,  # demo field is single-class
             "SessionFlags": 0,
             "SessionTimeRemain": max(0, 3 * 3600 - sim_t),
             "SessionNum": 0,
@@ -568,6 +579,8 @@ def build_snapshot(
             "name": display.names.get(p.car_idx, f"Car {p.car_idx}"),
             "car_number": display.numbers.get(p.car_idx, ""),
             "car_id": s.car_id if s else "",
+            "position": s.position if s else 0,
+            "class_position": s.class_position if s else 0,
             "current_lap": s.current_lap if s else 0,
             "pit_state": s.pit_state.value if s else "RACING",
             "last_pit_lap": s.last_pit_lap if s else 0,

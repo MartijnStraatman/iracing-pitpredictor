@@ -58,13 +58,14 @@ header{
 main{flex:1; overflow-y:auto; padding:14px 20px 4px}
 .colhead{
   display:grid; gap:12px; padding:0 12px 8px;
-  grid-template-columns:52px minmax(110px,1fr) 44px 88px 80px minmax(130px,1.8fr) 100px 112px 96px 72px;
+  grid-template-columns:38px 52px minmax(110px,1fr) 44px 88px 80px minmax(130px,1.8fr) 100px 112px 96px 72px;
   font-size:10px; color:var(--faint); text-transform:uppercase; letter-spacing:.14em;
 }
-.colhead span:nth-child(3),.colhead span:nth-child(5){text-align:right}
+/* Lap + Fuel headers, shifted one column right by the Pos column */
+.colhead span:nth-child(4),.colhead span:nth-child(6){text-align:right}
 .row{
   display:grid; gap:12px; align-items:center; padding:10px 12px;
-  grid-template-columns:52px minmax(110px,1fr) 44px 88px 80px minmax(130px,1.8fr) 100px 112px 96px 72px;
+  grid-template-columns:38px 52px minmax(110px,1fr) 44px 88px 80px minmax(130px,1.8fr) 100px 112px 96px 72px;
   background:var(--surface); border:1px solid var(--line); border-radius:6px;
   margin-bottom:6px; transition:background .3s;
 }
@@ -76,6 +77,12 @@ main{flex:1; overflow-y:auto; padding:14px 20px 4px}
   background:var(--cyan); border-radius:2px; padding:1px 5px; margin-left:6px; vertical-align:2px}
 .row.urgent{border-left:3px solid var(--amber); padding-left:10px}
 .row.critical{border-left:3px solid var(--red); padding-left:10px; background:#1d161a}
+
+.pos{text-align:center; font-variant-numeric:tabular-nums; line-height:1.1}
+.pos .big{font-family:"Chakra Petch"; font-weight:700; font-size:20px}
+.pos .sub{display:block; font-size:9px; color:var(--faint); letter-spacing:.06em}
+.pos .none{color:var(--faint); font-weight:400}
+.row.own .pos .big{color:var(--cyan)}
 
 .plate{
   background:var(--plate); color:var(--plate-text);
@@ -148,11 +155,13 @@ footer h2{font-family:"Chakra Petch"; font-size:10px; letter-spacing:.16em;
   .track{font-size:11px; color:var(--dim)}
   main{padding:10px 8px 2px}
   .colhead{display:none}
-  .row{grid-template-columns:44px 1fr 72px; grid-template-areas:
-    "plate who fuel" "stint stint stint" "state pitlap conf" "finish finish vsus"; row-gap:8px}
+  .row{grid-template-columns:30px 44px 1fr 72px; grid-template-areas:
+    "pos plate who fuel" "stint stint stint stint"
+    "state state pitlap conf" "finish finish finish vsus"; row-gap:8px}
   .chip{grid-area:state; justify-self:start; padding:4px 8px; white-space:nowrap}
   .finish{grid-area:finish; text-align:left; border-top:1px solid var(--line); padding-top:6px}
   .vsus{grid-area:vsus; text-align:right; border-top:1px solid var(--line); padding-top:6px}
+  .pos{grid-area:pos} .pos .big{font-size:17px} .pos .sub{display:none}
   .plate{grid-area:plate} .who{grid-area:who} .fuel{grid-area:fuel}
   .stint{grid-area:stint} .chip{grid-area:state} .pitlap{grid-area:pitlap; text-align:center}
   .conf{grid-area:conf} .lap{display:none}
@@ -176,7 +185,7 @@ footer h2{font-family:"Chakra Petch"; font-size:10px; letter-spacing:.16em;
 
 <main>
   <div class="colhead">
-    <span>No.</span><span>Team / Driver</span><span>Lap</span><span>State</span>
+    <span>Pos</span><span>No.</span><span>Team / Driver</span><span>Lap</span><span>State</span>
     <span>Fuel</span><span>Stint &amp; pit window</span><span>Pit lap</span><span>To finish</span><span>Vs us</span><span>Conf</span>
   </div>
   <div id="rows"><div class="empty">Waiting for telemetry from the pit box…</div></div>
@@ -235,6 +244,7 @@ function render(){
     const inPit = r.pit_state !== 'RACING';
     return `
     <div class="row ${isOurs ? 'own ' : ''}${crit ? 'critical' : warn ? 'urgent' : ''}">
+      ${posCell(r)}
       <div class="plate">${r.car_number || r.car_idx}</div>
       <div class="who"><div class="name">${esc(r.name || 'Car ' + r.car_idx)}${isOurs ? '<span class="ours">Our car</span>' : ''}</div>
         <div class="car">${esc(r.car_id || '')}</div></div>
@@ -256,6 +266,16 @@ function render(){
         <div class="basis">${(r.basis || '').replace(/_/g,' ').toLowerCase()}</div></div>
     </div>`;
   }).join('');
+}
+
+function posCell(r){
+  // Class position is the number that matters in a multiclass GT3 field --
+  // it is what compare_to_field scopes to. Overall is shown underneath only
+  // when the two differ, so single-class races stay uncluttered.
+  const cp = r.class_position || 0, op = r.position || 0;
+  if (!cp && !op) return '<div class="pos"><span class="big none">–</span></div>';
+  const sub = (cp && op && op !== cp) ? `<span class="sub">P${op} o/a</span>` : '';
+  return `<div class="pos"><span class="big">${cp || op}</span>${sub}</div>`;
 }
 
 function vsUsCell(r, isOurs){

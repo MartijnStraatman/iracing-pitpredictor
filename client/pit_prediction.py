@@ -180,6 +180,12 @@ class CompetitorState:
     car_id: str = ""
     class_id: str = ""
 
+    # live standings, straight from telemetry -- 0 means "not yet classified".
+    # Deliberately NOT persisted: position is a live fact, and a restored one
+    # would be stale the instant the process comes back up.
+    position: int = 0
+    class_position: int = 0
+
     # stint tracking
     current_stint_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     stint_number: int = 1
@@ -330,6 +336,9 @@ class PitPredictionEngine:
         lap_arr = frame["CarIdxLap"]
         last_lap_arr = self._safe_get(frame, "CarIdxLastLapTime")
         dist_arr = self._safe_get(frame, "CarIdxLapDistPct")
+        # length-checked below: these two are absent in some session types
+        pos_arr = self._safe_get(frame, "CarIdxPosition") or []
+        class_pos_arr = self._safe_get(frame, "CarIdxClassPosition") or []
 
         flags = self._safe_get(frame, "SessionFlags")
         if flags is not None:
@@ -352,6 +361,13 @@ class PitPredictionEngine:
             last_lap_time = last_lap_arr[car_idx] if last_lap_arr is not None else -1.0
             if dist_arr is not None and 0.0 <= dist_arr[car_idx] <= 1.0:
                 state.last_lap_dist_pct = dist_arr[car_idx]
+            # hold the last good value: iRacing briefly reports 0 for a car
+            # that is off-world or between sessions, and blanking the tower
+            # every time a rival clips a kerb would be worse than slightly old.
+            if car_idx < len(pos_arr) and pos_arr[car_idx] > 0:
+                state.position = pos_arr[car_idx]
+            if car_idx < len(class_pos_arr) and class_pos_arr[car_idx] > 0:
+                state.class_position = class_pos_arr[car_idx]
             self._track_laps(state, lap, last_lap_time)
             self._step_state_machine(state, bool(on_pit), surface, lap, now)
 

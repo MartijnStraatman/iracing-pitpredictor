@@ -264,6 +264,10 @@ async def _demo_feed() -> None:
                     "undercut_risk": -20 < gap < 0 and r["predicted_pit_lap_min"] <= us["predicted_pit_lap_min"] - 2,
                     "verdict": "AHEAD" if net > 10 else "BEHIND" if net < -10 else "FIGHT",
                 }
+        # race order straight off track progress -- single-class demo field,
+        # so overall and class position are the same number
+        for pos, r in enumerate(sorted(rows, key=lambda r: -r["_progress"]), 1):
+            r["position"] = r["class_position"] = pos
         for r in rows:
             r.pop("_progress", None)
         hub.ingest({
