@@ -1,0 +1,14 @@
+# secrets
+.env
+relay/.env
+
+# runtime state / captured race data
+client/drivers.json
+client/references.json
+relay/data/
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/

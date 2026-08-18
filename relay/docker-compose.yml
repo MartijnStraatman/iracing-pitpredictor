@@ -1,0 +1,16 @@
+services:
+  pitwall:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      INGEST_TOKEN: ${INGEST_TOKEN:?set in .env}
+      VIEW_TOKEN: ${VIEW_TOKEN:-}          # optional viewer key
+      EVENT_LOG: /data/events.jsonl
+      DEMO: ${DEMO:-}                      # 1 = self-generating sample race
+    volumes:
+      - pitwall-data:/data
+
+volumes:
+  pitwall-data:

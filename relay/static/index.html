@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pit Wall — Live Predictions</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#101418; --surface:#171c23; --surface2:#1c222b; --line:#232a34;
+  --text:#e6e9ee; --dim:#8b94a3; --faint:#5a6272;
+  --amber:#ffb020; --red:#ff5d5d; --green:#3fcf8e; --cyan:#58c7f3;
+  --plate:#f2f3f5; --plate-text:#14181e;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{
+  background:var(--bg); color:var(--text);
+  font-family:"IBM Plex Mono",ui-monospace,Consolas,monospace;
+  font-size:14px; -webkit-font-smoothing:antialiased;
+  display:flex; flex-direction:column;
+}
+.display{font-family:"Chakra Petch",system-ui,sans-serif}
+
+/* ---------- header ---------- */
+header{
+  display:flex; align-items:center; gap:20px;
+  padding:14px 20px; border-bottom:1px solid var(--line);
+  background:linear-gradient(180deg,var(--surface) 0%,var(--bg) 100%);
+}
+.wordmark{display:flex; align-items:baseline; gap:10px}
+.wordmark h1{
+  font-family:"Chakra Petch"; font-weight:700; font-size:19px;
+  letter-spacing:.18em; text-transform:uppercase;
+}
+.wordmark h1 em{font-style:normal; color:var(--amber)}
+.sess{display:flex; flex-direction:column; gap:2px}
+.track{color:var(--text); font-size:13px; letter-spacing:.04em}
+.meta{display:flex; gap:8px; align-items:center; font-size:10px; color:var(--dim);
+  text-transform:uppercase; letter-spacing:.1em}
+.stype{border:1px solid var(--cyan); color:var(--cyan); border-radius:3px; padding:1px 6px}
+.stype:empty{display:none}
+.spacer{flex:1}
+.clock{font-size:22px; font-weight:600; font-variant-numeric:tabular-nums; letter-spacing:.03em}
+.clock small{font-size:10px; color:var(--dim); display:block; letter-spacing:.14em; text-transform:uppercase; text-align:right}
+.feed{display:flex; align-items:center; gap:8px; font-size:11px; color:var(--dim);
+  text-transform:uppercase; letter-spacing:.1em}
+.led{width:9px; height:9px; border-radius:50%; background:var(--faint)}
+.feed.live .led{background:var(--green); box-shadow:0 0 8px var(--green); animation:pulse 2s infinite}
+.feed.live{color:var(--green)}
+.feed.stale .led{background:var(--amber)}
+.feed.stale{color:var(--amber)}
+@keyframes pulse{50%{opacity:.45}}
+@media (prefers-reduced-motion:reduce){.feed.live .led{animation:none}}
+
+/* ---------- tower ---------- */
+main{flex:1; overflow-y:auto; padding:14px 20px 4px}
+.colhead{
+  display:grid; gap:12px; padding:0 12px 8px;
+  grid-template-columns:52px minmax(110px,1fr) 44px 88px 80px minmax(130px,1.8fr) 100px 112px 96px 72px;
+  font-size:10px; color:var(--faint); text-transform:uppercase; letter-spacing:.14em;
+}
+.colhead span:nth-child(3),.colhead span:nth-child(5){text-align:right}
+.row{
+  display:grid; gap:12px; align-items:center; padding:10px 12px;
+  grid-template-columns:52px minmax(110px,1fr) 44px 88px 80px minmax(130px,1.8fr) 100px 112px 96px 72px;
+  background:var(--surface); border:1px solid var(--line); border-radius:6px;
+  margin-bottom:6px; transition:background .3s;
+}
+.row.own{border-color:var(--cyan); background:linear-gradient(90deg,rgba(88,199,243,.10),var(--surface) 45%);
+  box-shadow:inset 0 0 0 1px rgba(88,199,243,.25)}
+.row.own .plate{background:var(--cyan); color:var(--plate-text)}
+.ours{display:inline-block; font-family:"Chakra Petch"; font-size:9px; font-weight:600;
+  letter-spacing:.14em; text-transform:uppercase; color:var(--plate-text);
+  background:var(--cyan); border-radius:2px; padding:1px 5px; margin-left:6px; vertical-align:2px}
+.row.urgent{border-left:3px solid var(--amber); padding-left:10px}
+.row.critical{border-left:3px solid var(--red); padding-left:10px; background:#1d161a}
+
+.plate{
+  background:var(--plate); color:var(--plate-text);
+  font-family:"Chakra Petch"; font-weight:700; font-size:17px;
+  text-align:center; border-radius:4px; padding:5px 0; line-height:1;
+}
+.who .name{font-family:"Chakra Petch"; font-weight:600; font-size:14px; letter-spacing:.02em;
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+.who .car{font-size:10px; color:var(--faint); letter-spacing:.06em; text-transform:uppercase}
+.lap{text-align:right; color:var(--dim); font-variant-numeric:tabular-nums}
+
+.chip{
+  font-size:10px; letter-spacing:.1em; text-transform:uppercase; text-align:center;
+  border:1px solid var(--line); border-radius:3px; padding:4px 0; color:var(--dim);
+}
+.chip.pit{border-color:var(--cyan); color:var(--cyan)}
+
+.fuel{text-align:right; font-size:19px; font-weight:600; font-variant-numeric:tabular-nums}
+.fuel small{font-size:10px; color:var(--faint); font-weight:400; margin-left:2px}
+.fuel.warn{color:var(--amber)} .fuel.crit{color:var(--red)}
+
+/* signature: stint bar with pit-window band */
+.stint{position:relative; height:22px; background:var(--surface2);
+  border-radius:4px; overflow:hidden; border:1px solid var(--line)}
+.stint .fill{position:absolute; inset:0 auto 0 0; background:linear-gradient(90deg,#2b6f57,#3fcf8e);
+  opacity:.75; transition:width .8s ease}
+.stint .window{position:absolute; top:0; bottom:0;
+  background:repeating-linear-gradient(135deg,rgba(255,176,32,.35) 0 5px,rgba(255,176,32,.12) 5px 10px);
+  border-left:1px solid var(--amber); border-right:1px solid var(--amber)}
+.stint .best{position:absolute; top:-2px; bottom:-2px; width:2px; background:var(--amber)}
+.stint.crit .fill{background:linear-gradient(90deg,#7a3030,#ff5d5d)}
+@media (prefers-reduced-motion:reduce){.stint .fill{transition:none}}
+
+.pitlap{font-variant-numeric:tabular-nums}
+.pitlap .big{font-size:16px; font-weight:600}
+.pitlap .win{font-size:11px; color:var(--dim)}
+.pitlap .eta{font-size:11px; color:var(--cyan)}
+
+.finish{font-variant-numeric:tabular-nums}
+.finish .big{font-size:15px; font-weight:600}
+.finish .big.zero{color:var(--green)}
+.finish .sub{font-size:10px; color:var(--dim)}
+.finish .sub.save{color:var(--amber)}
+.vsus{font-variant-numeric:tabular-nums}
+.vsus .big{font-size:15px; font-weight:600}
+.vsus .big.ahead{color:var(--green)} .vsus .big.behind{color:var(--red)}
+.vsus .big.fight{color:var(--amber)}
+.vsus .sub{font-size:10px; color:var(--dim)}
+.vsus .sub.risk{color:var(--red); font-weight:600}
+.conf{font-size:11px; color:var(--dim); text-align:right}
+.conf .pips{letter-spacing:2px; font-size:12px}
+.conf .pips b{color:var(--green); font-weight:400}
+.conf.uncertain .pips b{color:var(--amber)}
+.conf .basis{font-size:9px; letter-spacing:.08em; text-transform:uppercase; color:var(--faint)}
+
+.empty{color:var(--faint); text-align:center; padding:60px 0; letter-spacing:.08em}
+
+/* ---------- ticker ---------- */
+footer{border-top:1px solid var(--line); background:var(--surface);
+  padding:8px 20px; max-height:120px; overflow-y:auto}
+footer h2{font-family:"Chakra Petch"; font-size:10px; letter-spacing:.16em;
+  text-transform:uppercase; color:var(--faint); margin-bottom:6px}
+.evt{font-size:12px; color:var(--dim); padding:2px 0}
+.evt time{color:var(--faint); margin-right:8px}
+.evt.fresh{color:var(--text)}
+
+/* ---------- mobile ---------- */
+@media (max-width:760px){
+  header{padding:10px 12px; gap:12px}
+  .track{font-size:11px; color:var(--dim)}
+  main{padding:10px 8px 2px}
+  .colhead{display:none}
+  .row{grid-template-columns:44px 1fr 72px; grid-template-areas:
+    "plate who fuel" "stint stint stint" "state pitlap conf" "finish finish vsus"; row-gap:8px}
+  .chip{grid-area:state; justify-self:start; padding:4px 8px; white-space:nowrap}
+  .finish{grid-area:finish; text-align:left; border-top:1px solid var(--line); padding-top:6px}
+  .vsus{grid-area:vsus; text-align:right; border-top:1px solid var(--line); padding-top:6px}
+  .plate{grid-area:plate} .who{grid-area:who} .fuel{grid-area:fuel}
+  .stint{grid-area:stint} .chip{grid-area:state} .pitlap{grid-area:pitlap; text-align:center}
+  .conf{grid-area:conf} .lap{display:none}
+}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wordmark">
+    <h1>Pit<em>Wall</em></h1>
+    <div class="sess">
+      <span class="track" id="track">—</span>
+      <span class="meta"><span class="stype" id="stype"></span><span id="cars"></span></span>
+    </div>
+  </div>
+  <div class="spacer"></div>
+  <div class="clock"><small>Session remaining</small><span id="clock">-:--:--</span></div>
+  <div class="feed" id="feed"><span class="led"></span><span id="feedText">Connecting</span></div>
+</header>
+
+<main>
+  <div class="colhead">
+    <span>No.</span><span>Team / Driver</span><span>Lap</span><span>State</span>
+    <span>Fuel</span><span>Stint &amp; pit window</span><span>Pit lap</span><span>To finish</span><span>Vs us</span><span>Conf</span>
+  </div>
+  <div id="rows"><div class="empty">Waiting for telemetry from the pit box…</div></div>
+</main>
+
+<footer>
+  <h2>Race events</h2>
+  <div id="events"></div>
+</footer>
+
+<script>
+const key = new URLSearchParams(location.search).get('key');
+const qs = key ? `?key=${encodeURIComponent(key)}` : '';
+let snapshot = null, lastMsg = 0;
+
+function fmtClock(s){
+  if (s == null || s < 0 || s > 36000) return '-:--:--';
+  s = Math.floor(s);
+  return `${Math.floor(s/3600)}:${String(Math.floor(s%3600/60)).padStart(2,'0')}:${String(s%60).padStart(2,'0')}`;
+}
+function fmtEta(mins){
+  if (mins == null) return 'no stop';
+  if (mins <= 0) return 'BOX NOW';
+  const m = Math.floor(mins), s = Math.round((mins - m) * 60);
+  return `in ${m}m${String(s).padStart(2,'0')}`;
+}
+function pips(conf){
+  const n = Math.round((conf || 0) * 3);
+  return '<b>' + '●'.repeat(n) + '</b>' + '○'.repeat(3 - n);
+}
+
+function render(){
+  if (!snapshot) return;
+  document.getElementById('track').textContent = snapshot.session?.track_display || snapshot.session?.track_id || '—';
+  document.getElementById('stype').textContent = snapshot.session?.session_type || '';
+  document.getElementById('cars').textContent = snapshot.session?.car_count ? snapshot.session.car_count + ' cars' : '';
+  document.getElementById('clock').textContent = fmtClock(snapshot.session?.time_remaining_s);
+
+  const rows = [...(snapshot.predictions || [])]
+    .sort((a, b) => a.laps_of_fuel_remaining - b.laps_of_fuel_remaining);
+
+  const host = document.getElementById('rows');
+  if (!rows.length){
+    host.innerHTML = '<div class="empty">Waiting for telemetry from the pit box…</div>';
+    return;
+  }
+  const ourIdx = snapshot.session?.player_car_idx;
+  host.innerHTML = rows.map(r => {
+    const isOurs = ourIdx != null && r.car_idx === ourIdx;
+    const fuel = r.laps_of_fuel_remaining;
+    const crit = fuel <= 1.5, warn = !crit && fuel <= 3;
+    const est = Math.max(1, r.predicted_pit_lap - (r.last_pit_lap || 0));
+    const done = Math.min(1, Math.max(0, (r.current_lap - (r.last_pit_lap || 0)) / est));
+    const wLo = Math.min(1, Math.max(0, (r.predicted_pit_lap_min - (r.last_pit_lap || 0)) / est));
+    const wHi = Math.min(1, Math.max(0, (r.predicted_pit_lap_max - (r.last_pit_lap || 0)) / est));
+    const inPit = r.pit_state !== 'RACING';
+    return `
+    <div class="row ${isOurs ? 'own ' : ''}${crit ? 'critical' : warn ? 'urgent' : ''}">
+      <div class="plate">${r.car_number || r.car_idx}</div>
+      <div class="who"><div class="name">${esc(r.name || 'Car ' + r.car_idx)}${isOurs ? '<span class="ours">Our car</span>' : ''}</div>
+        <div class="car">${esc(r.car_id || '')}</div></div>
+      <div class="lap">L${r.current_lap}</div>
+      <div class="chip ${inPit ? 'pit' : ''}">${inPit ? r.pit_state.replace('_',' ') : 'On track'}</div>
+      <div class="fuel ${crit ? 'crit' : warn ? 'warn' : ''}">${fuel.toFixed(1)}<small>laps</small></div>
+      <div class="stint ${crit ? 'crit' : ''}">
+        <div class="fill" style="width:${(done * 100).toFixed(1)}%"></div>
+        <div class="window" style="left:${(wLo * 100).toFixed(1)}%;width:${Math.max(1,(wHi - wLo) * 100).toFixed(1)}%"></div>
+        <div class="best" style="left:${(Math.min(1, Math.max(0, (r.predicted_pit_lap - (r.last_pit_lap||0)) / est)) * 100).toFixed(1)}%"></div>
+      </div>
+      <div class="pitlap"><span class="big">L${r.predicted_pit_lap}</span>
+        <span class="win">${r.predicted_pit_lap_min}–${r.predicted_pit_lap_max}</span><br>
+        <span class="eta">${fmtEta(r.pit_eta_min)}</span></div>
+      <div class="finish">${finishCell(r)}</div>
+      <div class="vsus">${vsUsCell(r, isOurs)}</div>
+      <div class="conf ${r.anchor_uncertain ? 'uncertain' : ''}">
+        <div class="pips">${pips(r.confidence)}</div>
+        <div class="basis">${(r.basis || '').replace(/_/g,' ').toLowerCase()}</div></div>
+    </div>`;
+  }).join('');
+}
+
+function vsUsCell(r, isOurs){
+  if (isOurs) return '<span class="sub">— us —</span>';
+  const v = r.vs_us;
+  if (!v) return '<span class="sub">—</span>';
+  const net = v.net_vs_us_s;
+  const cls = net > 10 ? 'ahead' : net < -10 ? 'behind' : 'fight';
+  const sign = net > 0 ? '+' : '';
+  let sub = '';
+  if (v.undercut_risk) sub = '<span class="sub risk">undercut risk</span>';
+  else if (v.stops_delta > 0) sub = `<span class="sub">owes ${v.stops_delta} stop${v.stops_delta > 1 ? 's' : ''} (+${Math.round(v.pit_debt_delta_s)}s)</span>`;
+  else if (v.stops_delta < 0) sub = `<span class="sub">we owe ${-v.stops_delta} (−${Math.round(-v.pit_debt_delta_s)}s)</span>`;
+  else sub = `<span class="sub">track ${v.gap_s > 0 ? '+' : ''}${v.gap_s.toFixed(0)}s</span>`;
+  return `<span class="big ${cls}" title="pace trend ${v.pace_trend_s > 0 ? '+' : ''}${v.pace_trend_s}s to flag">${sign}${net.toFixed(1)}s</span><br>${sub}`;
+}
+
+function finishCell(r){
+  if (r.stops_remaining == null) return '<span class="sub">—</span>';
+  if (r.stops_remaining === 0)
+    return '<span class="big zero">Flat out</span><br><span class="sub">no stop needed</span>';
+  const splash = r.final_stop_fill_l != null && r.final_stop_fill_l < 30;
+  const label = r.stops_remaining === 1
+    ? (splash ? 'Splash' : '1 stop')
+    : `${r.stops_remaining} stops${splash ? ' · last splash' : ''}`;
+  let sub = r.final_stop_fill_l != null ? `last fill ~${Math.round(r.final_stop_fill_l)}L` : '';
+  let cls = 'sub';
+  if (r.save_to_skip_l_per_lap){
+    sub = `−${r.save_to_skip_l_per_lap.toFixed(2)} L/lap skips a stop`;
+    cls = 'sub save';
+  }
+  return `<span class="big">${label}</span><br><span class="${cls}">${sub}</span>`;
+}
+
+function esc(s){ return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+function addEvent(e){
+  const host = document.getElementById('events');
+  const div = document.createElement('div');
+  div.className = 'evt fresh';
+  const t = e.ts ? new Date(e.ts) : new Date();
+  div.innerHTML = `<time>${t.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'})}</time>${esc(e.message || '')}`;
+  host.prepend(div);
+  setTimeout(() => div.classList.remove('fresh'), 4000);
+  while (host.children.length > 40) host.lastChild.remove();
+}
+
+function setFeed(cls, text){
+  const el = document.getElementById('feed');
+  el.className = 'feed ' + cls;
+  document.getElementById('feedText').textContent = text;
+}
+
+function connect(){
+  const es = new EventSource('/api/stream' + qs);
+  es.onmessage = m => {
+    lastMsg = Date.now();
+    const d = JSON.parse(m.data);
+    if (d.type === 'snapshot'){ snapshot = d; render(); setFeed('live', 'Live'); }
+    else if (d.type === 'event'){ addEvent(d); }
+    else if (d.type === 'heartbeat'){
+      if (d.feed_age_s == null || d.feed_age_s > 10) setFeed('stale', 'Pit box offline');
+    }
+  };
+  es.onerror = () => { setFeed('stale', 'Reconnecting'); };
+}
+setInterval(() => {
+  // local staleness check: no message of any kind for 30s = stream problem
+  if (lastMsg && Date.now() - lastMsg > 30000) setFeed('stale', 'Stream stalled');
+  // tick the clock down between snapshots
+  if (snapshot?.session?.time_remaining_s > 0 && snapshot._at){
+    const drift = (Date.now() - snapshot._at) / 1000;
+    document.getElementById('clock').textContent = fmtClock(snapshot.session.time_remaining_s - drift);
+  }
+}, 1000);
+// stamp arrival time for clock interpolation
+const _render = render;
+render = function(){ if (snapshot && !snapshot._at) snapshot._at = Date.now(); _render(); };
+connect();
+</script>
+</body>
+</html>
