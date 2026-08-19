@@ -51,15 +51,42 @@ STATIC_DIR = Path(__file__).parent / "static"
 class Hub:
     """Latest state + fanout to connected SSE clients."""
 
+    # Two-driver team setup: a client runs on BOTH drivers' PCs, each stamping
+    # payloads with client_id + driver_active (its member is in the car).
+    # While an active client is fresh, payloads from other clients are dropped
+    # -- otherwise two engines would interleave snapshots every second. With
+    # no active client (solo setups, everyone in the garage, legacy clients
+    # without the fields) everything is accepted, as before.
+    ACTIVE_HOLD_S = 15.0
+
     def __init__(self) -> None:
         self.snapshot: Optional[dict] = None
         self.client_state: Optional[dict] = None
         self.events: list = []
         self.last_ingest_ts: float = 0.0
         self.subscribers: Set[asyncio.Queue] = set()
+        self.active_client_id: Optional[str] = None
+        self.active_seen_ts: float = 0.0
+
+    def _accept(self, payload: dict) -> bool:
+        cid = payload.get("client_id")
+        if payload.get("driver_active"):
+            self.active_client_id = cid
+            self.active_seen_ts = time.time()
+            return True
+        if (
+            self.active_client_id is None
+            or time.time() - self.active_seen_ts > self.ACTIVE_HOLD_S
+        ):
+            return True
+        # the active client's own momentarily-inactive payloads (tow, reset)
+        # still pass; a different, passive client's do not
+        return cid == self.active_client_id
 
     def ingest(self, payload: dict) -> None:
         self.last_ingest_ts = time.time()
+        if not self._accept(payload):
+            return
         kind = payload.get("type")
         if kind == "state":
             # engine recovery state parked here for client-PC handoff;
