@@ -56,8 +56,16 @@ player-only). The engine infers it:
    burn. Stint 1 assumes a full tank, blended 30% toward reference to hedge
    underfuelled starts.
 4. **Pace→burn interpolation**: piecewise linear between save/baseline/push
-   anchors on lap-time delta, clamped both ends. Yellow laps weighted at
-   `yellow_burn_multiplier` (~0.45), tracked separately.
+   anchors on the delta between the car's pace now (median of its last 5 green
+   laps) and its OWN baseline pace (median of its last 20). The reference's
+   `baseline_lap_time_s` is only the fallback for a car that has not completed
+   a green lap yet. Anchoring the curve on that hand-entered constant is what
+   the code used to do, and whenever the constant was wrong — or silently
+   defaulted to 120.0 — every lap pinned at one end of the curve and stayed
+   there, the save end under-reading burn by ~10% for a whole race. Deltas
+   beyond ±5 s are traffic or an incident, not strategy, and return baseline
+   burn. Medians, not means, so one lap lost in traffic moves nothing. Yellow
+   laps weighted at `yellow_burn_multiplier` (~0.45), tracked separately.
 5. **Fuel-on-board accounting**: next stint start = leftover-at-entry +
    fuel added, capped at tank; snaps to full if within 6 L (fill-to-full).
 6. **Prediction**: fuel remaining / effective burn → pit lap + confidence
@@ -68,9 +76,30 @@ player-only). The engine infers it:
    track gap + (their remaining pit debt − ours); undercut flag when a rival
    is close behind with a window opening ≥2 laps earlier. Pace trend is
    reported but deliberately NOT folded into net (extrapolation ≠ math).
+9. **Measured mode (own car)**: `FuelLevel` + `PlayerCarIdx` in the frame
+   put the player's car on ground truth — fuel on board straight from the
+   gauge, burn from the median of the last 5 measured green-lap deltas
+   (basis `MEASURED`, confidence 0.95, band from the actual sample spread).
+   Validity is re-decided every frame: zero/absurd readings drop the mode
+   instantly, and a gauge frozen >10 s while RACING/EXITING is a dead feed
+   (teammate has the car). A constant reading IN_STALL is normal — engine
+   off — so the freshness clock keeps running there. Measured laps also
+   continuously EMA-calibrate `personal_burn_factor`, so fallback to
+   inference starts from real consumption, not priors; stops observed on
+   the gauge (entry captured while ENTERING, exit gauge = next stint
+   anchor, fill = delta) replace the stall-time arithmetic and the
+   fill-to-full snap. `estimated_fuel_l()` deliberately IGNORES the gauge —
+   it is the shadow inference the OWN-CAR CHECK line scores against it.
 
 Invariants that bugs love to violate:
 - All fuel quantities are litres; never infer more than `tank_capacity_l`.
+- Fuel accounting counts the lap in progress via `CarIdxLapDistPct`. Fuel
+  burns continuously but the lap counter only ticks at the line, so dropping
+  the fraction reads up to a full lap of fuel high — always optimistically,
+  and worst exactly where it matters, on the lap a car must commit to pitting.
+- Errors in this engine are not symmetric. Predicting a stop too late strands
+  a car on track; too early costs a few seconds. Where a signal is ambiguous,
+  resolve it toward more burn, not less.
 - `last_stop_fuel_added_l` stores fuel ON BOARD at stint start (leftover +
   added), not the raw fill — the name is historical.
 - Calibration divides THIS stop's fuel by THIS stint's laps.
@@ -82,9 +111,16 @@ Invariants that bugs love to violate:
 
 ## Team races: identity and client placement
 
-- Run ONE client instance, on any connected team member's PC — a non-driving
-  spotter is ideal (their sim never closes for a driver swap). Never run two;
-  both would push interleaved snapshots to the relay.
+- `FuelLevel` is cockpit telemetry: live only on the ACTIVE driver's PC,
+  frozen/zero for everyone else. For a two-driver lineup, run the client on
+  BOTH drivers' PCs so measured mode follows whoever is in the car. Every
+  uplink payload is stamped `client_id` + `driver_active` (`IsOnTrack` with
+  a 60 s hold-down); the relay (`Hub._accept`) keeps the active client's
+  feed and drops passive clients while an active one is fresh (15 s), so
+  the two never interleave and handover at a swap is automatic. Payloads
+  without the fields (legacy/solo) are accepted when no active client is
+  around — a single-client spotter setup still works, it just never gets
+  measured mode.
 - "Our car" = telemetry `PlayerCarIdx`, which points to the TEAM entry for
   every connected team member, not just the active driver.
 - Persistence keys use `_persist_id()`: TeamID when present (team sessions),
@@ -108,10 +144,29 @@ their next observed stop clears it.
 
 ## Reference data (`references.json`)
 
-Rows keyed car_id + track_id. Track rows inherit missing fields from the
-car's `"track_id": "*"` wildcard row — car-level properties (tank, refuel
-rate, tyre time) live once in the wildcard, track rows carry only burn/pace
-numbers. `tank_capacity_l` must be the **BoP-effective** capacity
+Rows keyed car_id + track_id. **Both ids are matched exactly and
+case-sensitively against the session YAML** — there is no normalisation:
+
+- `car_id` == `DriverInfo:Drivers[i]:CarPath`, e.g. `ferrari296gt3`
+- `track_id` == `WeekendInfo:TrackName`, the track folder plus its config,
+  lowercase and space-separated: `spa grandprix`, `spielberg gp`. NOT
+  `TrackDisplayName` ("Red Bull Ring") and not the short name.
+
+Track rows inherit missing fields from the car's `"track_id": "*"` wildcard
+row. Car-level properties (tank, refuel rate, tyre time) live once in the
+wildcard; track rows carry the burn/pace numbers. Give the wildcard a
+car-level burn estimate too — it is what an unlisted track falls back on, and
+a wildcard without one falls all the way to the generic 2.8 L/lap default.
+
+A row you need but do not have used to fail silently: the engine dropped to
+generic GT3 numbers and kept predicting at full confidence, ~30% off. The
+runner now reports each distinct problem once, to both console and dashboard —
+missing car, missing track row, required fields never set (`REQUIRED_REF_FIELDS`
+in the runner), and unrecognised field names, since a misspelt field is
+indistinguishable from an absent one. Keys prefixed `_` are ignored as
+annotations, which is how you comment a JSON row.
+
+`tank_capacity_l` must be the **BoP-effective** capacity
 (`DriverCarFuelMaxLtr × DriverCarMaxFuelPct`); the runner warns on mismatch
 for the player's own car model.
 
@@ -161,12 +216,39 @@ adding a test suite):
    `anchor_uncertain` set, cleared by next real stop.
 7. Lap counter reset mid-stream → stint tracking restarts, factors kept.
 8. Strategy: 20 min left → 0 stops; 60 min → 1 stop w/ save-to-skip;
-   100 min → 1 full stop; 170 min → 2 stops.
+   100 min → 1 full stop; 170 min → 2 stops. Pin `CarIdxLapDistPct` to 0.0
+   when asserting this — it holds for a car sampled at the line, mid-stint
+   (~lap 18 of a 140 s / 3.4 L-per-lap / 104 L config). Sampled mid-lap the
+   100-minute case needs 103.4 L of a 104 L tank and legitimately tips to
+   "2 stops, second a 2 L splash, save-to-skip flagged".
 9. compare_to_field: same-strategy rival ⇒ pit debt delta ≈ 0; short-filler
    ⇒ positive debt delta; close-behind rival w/ earlier window ⇒ undercut.
+10. Pace anchor: a car lapping consistently at 90 s with a reference whose
+    `baseline_lap_time_s` says 120 (or 140) must predict at BASELINE burn, not
+    push or save — the curve anchors on the car's own median, not the row.
+    Same car with a correct 90 s row must be unchanged. One 20 s traffic lap
+    inside the 5-lap window must not move the burn estimate.
+11. Measured mode: frames WITHOUT `FuelLevel`/`PlayerCarIdx` must reproduce
+    scenarios 1–10 byte-identically, and player fuel present must leave
+    competitor rows byte-identical. A player car on a 50 L partial load
+    (104 L reference tank) must predict from the gauge — basis MEASURED,
+    confidence 0.95, laps = (gauge − reserve) / measured burn — while
+    `estimated_fuel_l()` (the shadow) still believes the full-tank story.
+12. Gauge freeze (same value across >10 s of RACING frames) → measured mode
+    drops, basis reverts, and the fallback burn stays ≈ the measured value
+    (the measured laps EMA-calibrated `personal_burn_factor`). A live
+    reading afterwards resumes MEASURED immediately.
+13. Measured stop: entry gauge (captured while ENTERING) is the leftover,
+    exit gauge is the next stint anchor (no fill-to-full snap), fill =
+    delta and drives classification instead of stall time. The refuel jump
+    must never appear in `measured_burns`, and one low-burn traffic lap
+    must not move the measured median.
 
 Dashboard/relay: run relay locally, drive with `--demo --server
-http://localhost:8000 --token dev`, assert via `/api/state`.
+http://localhost:8000 --token dev`, assert via `/api/state`. Relay
+arbitration (`Hub._accept`): passive client dropped while an active one is
+fresh; active client's own momentarily-inactive payloads kept; stale active
+or field-less legacy payloads accepted.
 
 ## Style & constraints
 
@@ -191,5 +273,10 @@ http://localhost:8000 --token dev`, assert via `/api/state`.
 - events.jsonl is collected but unanalysed: post-race backtest comparing
   predicted vs actual pit laps should tune `burn_stddev` and EMA α.
 - Track temp / weather regression on burn rate (iRacing exposes both).
-- First stop of a deliberately underfuelled car is unpredictable by design;
-  everything self-corrects at that stop.
+- First stop of a deliberately underfuelled COMPETITOR is unpredictable by
+  design; everything self-corrects at that stop. (Our own car no longer has
+  this problem: measured mode reads the real load.)
+- Whether a non-driving team member's sim reports the team car's FuelLevel
+  is unverified — assumed dead (hence client-on-both-PCs). If a first team
+  session shows it live on the passive PC too, the two-client setup still
+  works; it is just redundant.

@@ -15,7 +15,7 @@ references.json format (list of reference rows, matched on car_id + track_id):
 [
   {
     "car_id": "ferrari296gt3",
-    "track_id": "spa",
+    "track_id": "spa grandprix",
     "tank_capacity_l": 104.0,
     "baseline_burn_l_per_lap": 3.4,
     "baseline_lap_time_s": 140.0,
@@ -27,7 +27,22 @@ references.json format (list of reference rows, matched on car_id + track_id):
     "fixed_pit_overhead_s": 4.0
   }
 ]
-Rows with track_id "*" act as car-level fallbacks for unknown tracks.
+
+Both ids are matched EXACTLY, case-sensitively, against the session YAML:
+  car_id   == DriverInfo:Drivers[i]:CarPath   e.g. "ferrari296gt3"
+  track_id == WeekendInfo:TrackName           e.g. "spa grandprix", "spielberg gp"
+TrackName is the track folder plus its config, lowercase and space-separated
+-- not TrackDisplayName ("Circuit de Spa-Francorchamps", "Red Bull Ring") and
+not the short name. To read both off a live session:
+
+    python -c "import irsdk;ir=irsdk.IRSDK();ir.startup();\
+print(repr(ir['WeekendInfo']['TrackName']));\
+print(sorted({d['CarPath'] for d in ir['DriverInfo']['Drivers']}))"
+
+Rows with track_id "*" act as car-level fallbacks for unknown tracks. A row
+you need but do not have is reported in the event log at startup -- an
+unmatched car silently falls back to generic GT3 numbers, which is a ~30%
+error on every prediction for it, so the misses are worth reading.
 """
 
 from __future__ import annotations
@@ -36,9 +51,10 @@ import argparse
 import json
 import sys
 import time
+import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 from pit_prediction import (
     CarTrackReference,
@@ -54,6 +70,13 @@ from pit_prediction import (
 
 POLL_HZ = 10
 DISPLAY_EVERY_S = 1.0
+
+# Two-driver team setup: the client runs on BOTH drivers' PCs so real
+# FuelLevel follows whoever is in the car. Every uplink payload is stamped
+# with this process id + whether OUR member is (recently) driving; the relay
+# prefers the active driver's feed and drops the passive one.
+CLIENT_ID = uuid.uuid4().hex[:12]
+DRIVER_ACTIVE_HOLD_S = 60.0  # stay "active" this long after leaving the car
 
 
 # ---------------------------------------------------------------------------
@@ -74,6 +97,7 @@ class Uplink:
         self.token = token
         self.q: "queue.Queue" = queue.Queue(maxsize=200)
         self.status = "starting"
+        self.driver_active = False  # set by the main loop from IsOnTrack
         t = threading.Thread(target=self._worker, daemon=True)
         t.start()
 
@@ -99,6 +123,10 @@ class Uplink:
         })
 
     def _put(self, item: dict) -> None:
+        # every payload carries who sent it and whether our member is driving,
+        # so the relay can arbitrate between the two team PCs' clients
+        item.setdefault("client_id", CLIENT_ID)
+        item.setdefault("driver_active", self.driver_active)
         try:
             self.q.put_nowait(item)
         except Exception:
@@ -129,7 +157,21 @@ class Uplink:
 # Reference table loading
 # ---------------------------------------------------------------------------
 
-def load_references(path: Optional[str]) -> Dict[str, CarTrackReference]:
+# The numbers a row has to carry to be worth anything. Every field left unset
+# silently takes a CarTrackReference default -- generic GT3, 100 L, 2.8 L/lap
+# at a 120 s lap -- and the engine then predicts from it with a straight face.
+REQUIRED_REF_FIELDS = (
+    "tank_capacity_l",
+    "baseline_burn_l_per_lap",
+    "push_burn_l_per_lap",
+    "save_burn_l_per_lap",
+)
+
+
+def load_references(
+    path: Optional[str],
+    on_warn: Optional[Callable[[str], None]] = None,
+) -> Tuple[Dict[str, CarTrackReference], Dict[str, List[str]]]:
     """
     Load reference rows keyed by 'car_id|track_id'.
 
@@ -137,30 +179,103 @@ def load_references(path: Optional[str]) -> Dict[str, CarTrackReference]:
     wildcard row (track_id "*"). Put car-level properties -- tank_capacity_l,
     refuel_rate_l_per_s, tyre_change_time_s -- in the wildcard row once, and
     keep track rows down to the track-dependent numbers (burn rates, lap time).
+
+    Returns (references, gaps), where gaps maps the same keys to the
+    REQUIRED_REF_FIELDS the file never set for that row -- reported by the
+    provider so a half-filled row cannot pass for a measured one.
+
+    Unrecognised keys are still ignored rather than fatal, but they are
+    reported: a misspelt field is indistinguishable from an absent one, and
+    silently reverting to a default is how a reference file lies. Prefix a key
+    with "_" to annotate a row without tripping the check.
     """
     refs: Dict[str, CarTrackReference] = {}
+    gaps: Dict[str, List[str]] = {}
     if not path:
-        return refs
+        return refs, gaps
     data = json.loads(Path(path).read_text())
     valid = {f.name for f in CarTrackReference.__dataclass_fields__.values()}
+    unknown = sorted(
+        {k for row in data for k in row if k not in valid and not k.startswith("_")}
+    )
+    if unknown and on_warn:
+        on_warn(
+            f"WARNING: {path} has unrecognised field(s) {', '.join(unknown)} -- "
+            f"ignored, so those rows are using defaults. Check the spelling."
+        )
     rows = [{k: v for k, v in row.items() if k in valid} for row in data]
+    for i, row in enumerate(rows):
+        if "car_id" not in row or "track_id" not in row:
+            raise ValueError(
+                f"{path}: row {i} needs both car_id and track_id "
+                f'(use "track_id": "*" for a car-level fallback row)'
+            )
 
-    wildcards = {r["car_id"]: r for r in rows if r.get("track_id", "*") == "*"}
+    wildcards = {r["car_id"]: r for r in rows if r["track_id"] == "*"}
     for row in rows:
         base = wildcards.get(row["car_id"], {})
         merged = {**base, **row}
         ref = CarTrackReference(**merged)
-        refs[f"{ref.car_id}|{ref.track_id}"] = ref
-    return refs
+        key = f"{ref.car_id}|{ref.track_id}"
+        refs[key] = ref
+        missing = [f for f in REQUIRED_REF_FIELDS if f not in merged]
+        if missing:
+            gaps[key] = missing
+    return refs, gaps
 
 
-def make_reference_provider(refs: Dict[str, CarTrackReference], track_id: str):
+def make_reference_provider(
+    refs: Dict[str, CarTrackReference],
+    track_id: str,
+    gaps: Optional[Dict[str, List[str]]] = None,
+    on_warn: Optional[Callable[[str], None]] = None,
+):
+    """
+    Resolve a car's reference row: exact car+track, else the car's '*' row.
+
+    A miss used to return None and say nothing, which is the worst way for
+    this to fail: the engine falls back to generic GT3 numbers and keeps
+    predicting at full confidence, reading ~30% off for the rest of the race.
+    Every distinct problem is now reported once through `on_warn`, quoting the
+    exact track_id string to paste into references.json.
+    """
+    gaps = gaps or {}
+    default = PitPredictionEngine.DEFAULT_REFERENCE
+    warned: set = set()
+
+    def warn(msg: str) -> None:
+        if on_warn and msg not in warned:
+            warned.add(msg)
+            on_warn(msg)
+
     def provider(state: CompetitorState) -> Optional[CarTrackReference]:
-        return (
-            refs.get(f"{state.car_id}|{track_id}")
-            or refs.get(f"{state.car_id}|*")
-            or None
-        )
+        car = state.car_id
+        if not car:
+            return None  # roster not loaded yet; asked again on the next refresh
+        exact, wild = f"{car}|{track_id}", f"{car}|*"
+        key = exact if exact in refs else wild if wild in refs else None
+        if key is None:
+            warn(
+                f"WARNING: no reference row for '{car}' -- falling back to generic "
+                f"GT3 ({default.tank_capacity_l:.0f}L, "
+                f"{default.baseline_burn_l_per_lap} L/lap). Add a row with "
+                f'"car_id": "{car}", "track_id": "{track_id}".'
+            )
+            return None
+        if key == wild:
+            warn(
+                f"WARNING: no row for '{car}' at '{track_id}' -- using the "
+                f"'{car}|*' fallback. Add a row with "
+                f'"track_id": "{track_id}" to references.json.'
+            )
+        if gaps.get(key):
+            warn(
+                f"WARNING: reference '{key}' never sets "
+                f"{', '.join(gaps[key])} -- those take generic defaults and "
+                f"skew every prediction for this car."
+            )
+        return refs[key]
+
     return provider
 
 
@@ -202,6 +317,7 @@ class IRacingSource:
                 "SessionNum": self.ir["SessionNum"],
                 "FuelLevel": self.ir["FuelLevel"],
                 "PlayerCarIdx": self.ir["PlayerCarIdx"],
+                "IsOnTrack": bool(self.ir["IsOnTrack"]),
             }
         finally:
             self.ir.unfreeze_var_buffer_latest()
@@ -310,9 +426,18 @@ class DemoSource:
             "SessionFlags": 0,
             "SessionTimeRemain": max(0, 3 * 3600 - sim_t),
             "SessionNum": 0,
-            "FuelLevel": max(2.0, 104 - (sim_t / self.cars[0]["lap_time"]) * 3.55),
+            "FuelLevel": self._demo_fuel(sim_t),
             "PlayerCarIdx": 0,
+            "IsOnTrack": True,
         }
+
+    def _demo_fuel(self, sim_t: float) -> float:
+        # burn continuously, refill when car 0's demo stop completes -- so the
+        # measured-fuel path sees a realistic gauge, refuel jump included
+        car = self.cars[0]
+        pit_end = car["pit_on_lap"] * car["lap_time"] + 8 + car["stop_s"]
+        since_fill = sim_t - pit_end if sim_t >= pit_end else sim_t
+        return max(2.0, 104 - (since_fill / car["lap_time"]) * 3.55)
 
     def session_info(self) -> dict:
         return {
@@ -505,8 +630,10 @@ class GroundTruthValidator:
             state = engine.competitors.get(idx)
             ref = engine._reference_for(state) if state else None
             if state and ref:
-                pace = state.rolling_avg_lap_time_s or ref.baseline_lap_time_s
-                model_burn = reference_burn_for_pace(ref, pace) * state.personal_burn_factor
+                pace = state.rolling_pace_s or ref.baseline_lap_time_s
+                model_burn = reference_burn_for_pace(
+                    ref, pace, state.pace_baseline_s
+                ) * state.personal_burn_factor
                 parts.append(f"burn {model_burn:.2f} vs {actual_burn:.2f} L/lap (d{model_burn - actual_burn:+.2f})")
         self.line = "  OWN-CAR CHECK: " + "  |  ".join(parts)
 
@@ -570,7 +697,7 @@ def build_snapshot(
     rows = []
     for p in preds:
         s = engine.competitors.get(p.car_idx)
-        pace = s.rolling_avg_lap_time_s if s else 0
+        pace = s.rolling_pace_s if s else 0
         rows.append({
             **p.to_dict(),
             "predicted_pit_time": None,  # ETA in minutes travels better than ts
@@ -614,16 +741,25 @@ def main() -> int:
     args = ap.parse_args()
 
     source = DemoSource() if args.demo else IRacingSource()
-    refs = load_references(args.refs)
     display = ConsoleDisplay()
     validator = GroundTruthValidator()
     uplink = Uplink(args.server, args.token) if args.server and args.token else None
+
+    def warn(msg: str) -> None:
+        """Config problems go to the team dashboard too -- an engineer reading
+        predictions deserves to know they are running on generic numbers."""
+        display.add_event(msg)
+        if uplink:
+            uplink.send_event(msg)
+
+    refs, ref_gaps = load_references(args.refs, warn)
 
     engine: Optional[PitPredictionEngine] = None
     latest_info: dict = {}
     session_id_seen: Optional[str] = None
     last_render = 0.0
     last_roster_refresh = 0.0
+    last_on_track = -1.0  # monotonic ts our member was last in the car
 
     try:
         while True:
@@ -634,6 +770,16 @@ def main() -> int:
                 display.render([], engine or PitPredictionEngine(), None, connected=False)
                 time.sleep(2)
                 continue
+
+            # active-driver flag for relay arbitration between team PCs, with
+            # hold-down so a tow or brief reset doesn't flap the feed
+            if frame.get("IsOnTrack"):
+                last_on_track = loop_start
+            if uplink:
+                uplink.driver_active = (
+                    last_on_track >= 0
+                    and loop_start - last_on_track < DRIVER_ACTIVE_HOLD_S
+                )
 
             # (re)initialise engine when a new session appears
             info = {}
@@ -664,7 +810,10 @@ def main() -> int:
                 if engine is None or (sid and sid != session_id_seen):
                     engine = PitPredictionEngine(
                         reference_provider=make_reference_provider(
-                            refs, (info or {}).get("track_id", "unknown")
+                            refs,
+                            (info or {}).get("track_id", "unknown"),
+                            ref_gaps,
+                            warn,
                         ),
                         session_id=sid or "live",
                     )
@@ -727,7 +876,7 @@ def main() -> int:
                     if eff and pcar:
                         row = refs.get(f"{pcar}|{(info or {}).get('track_id')}") or refs.get(f"{pcar}|*")
                         if row and abs(row.tank_capacity_l - eff) > 2.0:
-                            display.add_event(
+                            warn(
                                 f"WARNING: reference tank for {pcar} is "
                                 f"{row.tank_capacity_l:.0f}L but BoP-effective tank is "
                                 f"{eff:.0f}L -- update references.json (predictions "

@@ -1,9 +1,15 @@
 [
   {"car_id": "ferrari296gt3", "track_id": "*",
    "tank_capacity_l": 104.0, "refuel_rate_l_per_s": 2.5,
-   "tyre_change_time_s": 22.0, "fixed_pit_overhead_s": 4.0},
+   "tyre_change_time_s": 22.0, "fixed_pit_overhead_s": 4.0,
+   "baseline_burn_l_per_lap": 3.2, "push_burn_l_per_lap": 3.5,
+   "save_burn_l_per_lap": 2.9, "baseline_lap_time_s": 130.0},
 
-  {"car_id": "ferrari296gt3", "track_id": "spa",
+  {"car_id": "ferrari296gt3", "track_id": "spa grandprix",
    "baseline_burn_l_per_lap": 3.4, "baseline_lap_time_s": 140.0,
-   "push_burn_l_per_lap": 3.7, "save_burn_l_per_lap": 3.1, "burn_stddev": 0.1}
+   "push_burn_l_per_lap": 3.7, "save_burn_l_per_lap": 3.1, "burn_stddev": 0.1},
+
+  {"car_id": "ferrari296gt3", "track_id": "spielberg gp",
+   "baseline_burn_l_per_lap": 3.0, "baseline_lap_time_s": 90.0,
+   "push_burn_l_per_lap": 3.3, "save_burn_l_per_lap": 2.7, "burn_stddev": 0.1}
 ]

@@ -25,6 +25,9 @@ instance itself or a snapshot dict:
     frame['CarIdxTrackSurface'] -> list[int]
     frame['CarIdxLap']          -> list[int]
     frame['CarIdxLastLapTime']  -> list[float]
+    frame['CarIdxLapDistPct']   -> list[float] (optional; without it fuel
+                                   accounting is quantised to whole laps and
+                                   reads optimistically inside one)
     frame['SessionFlags']       -> int (optional, for yellow detection)
 
 No external dependencies. Persistence (Redis/DB) is left to the caller via
@@ -37,6 +40,7 @@ import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta
 from enum import Enum
+from statistics import median, pstdev
 from typing import Callable, Dict, List, Optional
 
 # ---------------------------------------------------------------------------
@@ -84,6 +88,7 @@ class PredictionBasis(str, Enum):
     PRIOR_ONLY = "PRIOR_ONLY"
     SINGLE_OBSERVATION = "SINGLE_OBSERVATION"
     MULTI_OBSERVATION = "MULTI_OBSERVATION"
+    MEASURED = "MEASURED"  # fuel on board read from FuelLevel (own car only)
 
 
 # ---------------------------------------------------------------------------
@@ -215,6 +220,18 @@ class CompetitorState:
     last_stop_fuel_added_l: float = 0.0
     last_calibrated_at: Optional[datetime] = None
 
+    # measured fuel -- the player's own car only. FuelLevel is cockpit
+    # telemetry: live while OUR member drives, frozen or zero when a teammate
+    # has the car. Validity is re-checked every frame; every consumer falls
+    # back to the inference path the moment the reading dies.
+    measured_fuel_l: Optional[float] = None
+    measured_burns: List[float] = field(default_factory=list)  # green-lap deltas
+    _measured_last_value: Optional[float] = None
+    _measured_changed_at: Optional[datetime] = None
+    _measured_lap: int = -1
+    _measured_lap_start_fuel: Optional[float] = None
+    _measured_stall_entry_fuel: Optional[float] = None
+
     # crash / restart recovery
     anchor_uncertain: bool = False   # stint anchor may be stale after a restore
     _restored_lap: int = -1          # lap at snapshot time, for gap detection
@@ -223,32 +240,85 @@ class CompetitorState:
     _last_seen_lap: int = -1
     _last_lap_was_yellow: bool = False
 
-    ROLLING_WINDOW = 5
+    ROLLING_WINDOW = 5   # laps behind the "pace right now" figure
+    PACE_WINDOW = 20     # laps behind this car's own baseline pace
+    MEASURED_BURN_WINDOW = 5       # green-lap deltas kept for measured burn
+    MEASURED_BURN_MIN_SAMPLES = 3  # fewer than this: burn stays inferred
 
     @property
-    def rolling_avg_lap_time_s(self) -> float:
+    def rolling_pace_s(self) -> float:
+        """Pace right now: the MEDIAN of the last few green laps, not the mean.
+        One lap lost to traffic must not drag the burn estimate by seconds."""
         recent = self.lap_times[-self.ROLLING_WINDOW:]
-        return sum(recent) / len(recent) if recent else 0.0
+        return median(recent) if recent else 0.0
+
+    @property
+    def pace_baseline_s(self) -> float:
+        """This car's own representative green pace -- the anchor its burn
+        curve is quoted against (see reference_burn_for_pace). 0.0 until it
+        has completed a green lap, which is the only time the reference's
+        hand-entered baseline_lap_time_s is used instead."""
+        recent = self.lap_times[-self.PACE_WINDOW:]
+        return median(recent) if recent else 0.0
 
     @property
     def stint_avg_lap_time_s(self) -> float:
         return sum(self.lap_times) / len(self.lap_times) if self.lap_times else 0.0
+
+    @property
+    def measured_burn_l_per_lap(self) -> Optional[float]:
+        """Median of the last few measured green-lap burns. Median, not mean:
+        a lap in traffic burns less and must not drag the estimate."""
+        if len(self.measured_burns) >= self.MEASURED_BURN_MIN_SAMPLES:
+            return median(self.measured_burns)
+        return None
 
 
 # ---------------------------------------------------------------------------
 # Pace-to-burn interpolation
 # ---------------------------------------------------------------------------
 
-SAVE_DELTA_S = 1.5   # saving stint ~1.5s off baseline pace
-PUSH_DELTA_S = -0.8  # push lap ~0.8s under baseline
+SAVE_DELTA_S = 1.5    # this far off the car's own pace => full fuel-save burn
+PUSH_DELTA_S = -0.8   # this far under it => full push burn
+PACE_OUTLIER_S = 5.0  # beyond this the lap time is not a strategy signal
 
 
-def reference_burn_for_pace(ref: CarTrackReference, avg_lap_time_s: float) -> float:
-    """Expected burn/lap at the observed pace, piecewise-linear between anchors."""
-    if avg_lap_time_s <= 0:
+def reference_burn_for_pace(
+    ref: CarTrackReference,
+    lap_time_s: float,
+    pace_anchor_s: Optional[float] = None,
+) -> float:
+    """
+    Expected burn/lap at the observed pace, piecewise-linear between anchors.
+
+    `pace_anchor_s` is the pace that counts as "baseline" for THIS car right
+    now -- normally its own median green lap (CompetitorState.pace_baseline_s).
+    Anchoring on the car itself rather than on ref.baseline_lap_time_s is
+    deliberate. That reference number is hand-entered, and when it is off --
+    wrong BoP, different conditions, or simply never filled in, in which case
+    it silently defaults to 120.0 -- every lap lands at one end of the curve
+    and stays there. The save end then under-reads burn by ~10% for the whole
+    race, and under-reading burn is the one error a pit predictor must not
+    make. Anchored on the car's own median the delta is ~0 whenever it is
+    running normally, so the curve only moves when the driver actually changes
+    what they are doing.
+
+    Falls back to the reference constant only for a car with no green laps yet.
+    """
+    if lap_time_s <= 0:
         return ref.baseline_burn_l_per_lap
+    anchor = (
+        pace_anchor_s
+        if pace_anchor_s and pace_anchor_s > 0
+        else ref.baseline_lap_time_s
+    )
 
-    delta = avg_lap_time_s - ref.baseline_lap_time_s
+    delta = lap_time_s - anchor
+    # A swing this big is traffic, a spin, damage or weather -- not a driver
+    # choosing to lift and coast. Reading it as a fuel save would be the
+    # optimistic failure again, so treat it as no information at all.
+    if abs(delta) > PACE_OUTLIER_S:
+        return ref.baseline_burn_l_per_lap
     if delta >= 0:
         t = min(delta / SAVE_DELTA_S, 1.0)
         return ref.baseline_burn_l_per_lap * (1 - t) + ref.save_burn_l_per_lap * t
@@ -282,6 +352,8 @@ class PitPredictionEngine:
 
     DEFAULT_REFERENCE = CarTrackReference(car_id="_generic_gt3", track_id="_unknown")
     FILL_TO_FULL_MARGIN_L = 6.0  # inferred board fuel within this of capacity => full
+    MEASURED_STALE_S = 10.0      # racing fuel gauge frozen this long => dead feed
+    MEASURED_BURN_UNC_FLOOR_L = 0.08  # band floor even on a rock-steady gauge
 
     def __init__(
         self,
@@ -346,6 +418,9 @@ class PitPredictionEngine:
                 flags & (FLAG_CAUTION | FLAG_CAUTION_WAVING | FLAG_YELLOW | FLAG_YELLOW_WAVING)
             )
 
+        player_idx = self._safe_get(frame, "PlayerCarIdx")
+        player_fuel = self._safe_get(frame, "FuelLevel")
+
         for car_idx, on_pit in enumerate(on_pit_arr):
             surface = surface_arr[car_idx]
             if surface == TRK_NOT_IN_WORLD and car_idx not in self.competitors:
@@ -370,6 +445,8 @@ class PitPredictionEngine:
                 state.class_position = class_pos_arr[car_idx]
             self._track_laps(state, lap, last_lap_time)
             self._step_state_machine(state, bool(on_pit), surface, lap, now)
+            if player_idx is not None and car_idx == player_idx:
+                self._ingest_measured_fuel(state, player_fuel, lap, now)
 
     def predict(
         self,
@@ -397,15 +474,18 @@ class PitPredictionEngine:
         return preds
 
     def estimated_fuel_l(self, car_idx: int) -> Optional[float]:
-        """Model's current fuel-on-board estimate for a car. For validating
-        the inference against ground truth (your own car's FuelLevel)."""
+        """The INFERENCE path's fuel-on-board estimate for a car -- it
+        deliberately ignores the measured gauge, so on the player's car it
+        stays a shadow model that can be scored against the real FuelLevel."""
         state = self.competitors.get(car_idx)
         if state is None or state.current_lap <= 0:
             return None
         ref = self._reference_for(state)
-        pace = state.rolling_avg_lap_time_s or ref.baseline_lap_time_s
-        burn = reference_burn_for_pace(ref, pace) * state.personal_burn_factor
-        return self._fuel_remaining(state, ref, burn)
+        pace = state.rolling_pace_s or ref.baseline_lap_time_s
+        burn = reference_burn_for_pace(
+            ref, pace, state.pace_baseline_s
+        ) * state.personal_burn_factor
+        return self._fuel_remaining(state, ref, burn, ignore_measured=True)
 
     def export_state(self) -> dict:
         """Full serializable snapshot (calibration + stint anchors), by cust_id."""
@@ -422,6 +502,7 @@ class PitPredictionEngine:
                 "current_lap": s.current_lap,
                 "green_laps": s.green_laps,
                 "yellow_laps": s.yellow_laps,
+                "measured_burns": [round(b, 3) for b in s.measured_burns],
             }
         return out
 
@@ -452,6 +533,7 @@ class PitPredictionEngine:
                 s.stint_number = data.get("stint_number", 1)
                 s.green_laps = data.get("green_laps", 0)
                 s.yellow_laps = data.get("yellow_laps", 0)
+                s.measured_burns = list(data.get("measured_burns", []))
                 s._restored_lap = data.get("current_lap", -1)
             else:
                 # decay imported confidence -- conditions may have changed
@@ -502,6 +584,92 @@ class PitPredictionEngine:
                     if len(state.lap_times) > 50:
                         state.lap_times = state.lap_times[-50:]
         state._last_seen_lap = lap
+
+    # -- measured fuel (own car only) ---------------------------------------
+
+    def _ingest_measured_fuel(
+        self, state: CompetitorState, fuel: Optional[float], lap: int, now: datetime
+    ) -> None:
+        """
+        FuelLevel is ground truth for the player's car -- while it is live.
+        In team sessions it freezes or reads zero the moment a teammate has
+        the car, so validity is re-decided every frame: a zero/absurd value
+        drops measured mode instantly, and a reading that stops moving while
+        the car is racing is a dead feed (fuel burns continuously; live
+        telemetry ticks every few frames). Everything downstream falls back
+        to the calibrated inference, and snaps back to truth when the gauge
+        comes alive again.
+        """
+        if fuel is None or not (0.0 < fuel < 250.0):
+            state.measured_fuel_l = None
+            state._measured_lap_start_fuel = None
+            return
+        # A constant reading is normal in the stall (engine off, refuel done),
+        # so the freshness clock keeps running there -- otherwise pit-lane
+        # exit would start with the clock already expired and flag a healthy
+        # gauge as dead.
+        if fuel != state._measured_last_value or state.pit_state == PitState.IN_STALL:
+            state._measured_last_value = fuel
+            state._measured_changed_at = now
+        frozen = (
+            state.pit_state in (PitState.RACING, PitState.EXITING)
+            and state._measured_changed_at is not None
+            and (now - state._measured_changed_at).total_seconds() > self.MEASURED_STALE_S
+        )
+        if frozen:
+            state.measured_fuel_l = None
+            state._measured_lap_start_fuel = None
+            return
+        state.measured_fuel_l = fuel
+
+        # What was on board approaching the stall -- read while still moving
+        # (ENTERING), so a feed that dies during a driver-swap stop cannot
+        # poison the leftover figure with a mid-refuel value.
+        if state.pit_state == PitState.ENTERING:
+            state._measured_stall_entry_fuel = fuel
+
+        # One completed green racing lap => one measured burn sample.
+        if lap != state._measured_lap:
+            prev_start = state._measured_lap_start_fuel
+            if (
+                prev_start is not None
+                and lap == state._measured_lap + 1
+                and state.pit_state == PitState.RACING
+                and not self._is_yellow
+            ):
+                burned = prev_start - fuel
+                if 0.0 < burned < 10.0:  # a refuel jump is negative; noise is huge
+                    state.measured_burns.append(burned)
+                    state.measured_burns = state.measured_burns[
+                        -CompetitorState.MEASURED_BURN_WINDOW:
+                    ]
+                    self._calibrate_from_measured(state, now)
+            state._measured_lap = lap
+            state._measured_lap_start_fuel = (
+                fuel if state.pit_state == PitState.RACING else None
+            )
+
+    def _calibrate_from_measured(self, state: CompetitorState, now: datetime) -> None:
+        """Keep the shadow inference calibrated from measured burn, so the
+        fallback (teammate driving, feed loss) starts from truth, not priors."""
+        measured = state.measured_burn_l_per_lap
+        if measured is None:
+            return
+        ref = self._reference_for(state)
+        pace = state.rolling_pace_s or ref.baseline_lap_time_s
+        expected = reference_burn_for_pace(ref, pace, state.pace_baseline_s)
+        if expected <= 0:
+            return
+        factor = measured / expected
+        if not 0.6 <= factor <= 1.5:
+            return
+        state.personal_burn_factor = (
+            self.alpha * factor + (1 - self.alpha) * state.personal_burn_factor
+        )
+        state.personal_burn_confidence = min(
+            1.0, len(state.measured_burns) / CompetitorState.MEASURED_BURN_MIN_SAMPLES
+        )
+        state.last_calibrated_at = now
 
     # -- state machine ------------------------------------------------------
 
@@ -577,10 +745,19 @@ class PitPredictionEngine:
         ref = self._reference_for(state)
 
         # Estimate fuel still on board at pit entry (model-derived leftover).
+        # ignore_measured: by stint close the car has refuelled, so the live
+        # gauge is next-stint fuel, not what it arrived with -- that arrival
+        # figure is the gauge captured on pit ENTRY, when available.
         pace = state.stint_avg_lap_time_s or ref.baseline_lap_time_s
-        entry_burn = reference_burn_for_pace(ref, pace) * state.personal_burn_factor
-        leftover = max(0.0, min(self._fuel_remaining(state, ref, entry_burn),
-                                ref.tank_capacity_l))
+        entry_burn = reference_burn_for_pace(
+            ref, pace, state.pace_baseline_s
+        ) * state.personal_burn_factor
+        leftover = max(0.0, min(
+            self._fuel_remaining(state, ref, entry_burn, ignore_measured=True),
+            ref.tank_capacity_l,
+        ))
+        if state._measured_stall_entry_fuel is not None:
+            leftover = max(0.0, state._measured_stall_entry_fuel)
 
         pit_evt = self._build_pit_event(state, ref, now)
         stint_evt = self._build_stint_event(state, ref, pit_evt, now)
@@ -601,6 +778,10 @@ class PitPredictionEngine:
             start_fuel = ref.tank_capacity_l
         if pit_evt.classified_as == StopClass.DAMAGE:
             start_fuel = leftover  # tow/repair stop: no confident fuel info
+        if state.measured_fuel_l is not None:
+            # gauge at pit exit IS next-stint fuel -- overrides every
+            # inference above, including the fill-to-full snap
+            start_fuel = state.measured_fuel_l
 
         # roll into new stint
         state.last_pit_lap = lap
@@ -618,27 +799,47 @@ class PitPredictionEngine:
         state.stall_duration_s = 0.0
         state.was_towed = False
         state.anchor_uncertain = False  # real stop observed -> anchor is solid again
+        state._measured_stall_entry_fuel = None
 
     def _build_pit_event(
         self, state: CompetitorState, ref: CarTrackReference, now: datetime
     ) -> PitStopEvent:
         dur = state.stall_duration_s
         service_time = max(0.0, dur - ref.fixed_pit_overhead_s)
-
-        # tyre change detection: is the stop long enough for tyres at all?
         min_tyre_stop = ref.tyre_change_time_s * 0.8
-        tyre_change = service_time >= min_tyre_stop
 
-        fuel_time = service_time - (ref.tyre_change_time_s if tyre_change else 0.0)
-        fuel_added = max(0.0, fuel_time * ref.refuel_rate_l_per_s)
-        # A stop can be long for reasons that aren't fuel (driver swap, repairs,
-        # waiting out a penalty) -- never infer more than the tank can hold.
-        fuel_added = min(fuel_added, ref.tank_capacity_l)
-        # refuel and tyre change run concurrently in most GT3 series? In iRacing
-        # they are sequential for fixed stops; if fuel_time went negative the
-        # stop was tyres-only length.
-        if tyre_change and fuel_time <= 0:
-            fuel_added = 0.0
+        # Own car with a live gauge: the refuel was WATCHED (level rose during
+        # the stall), so take the fill from the gauge and only infer whether
+        # the remaining stall time also covered tyres. Requires both a valid
+        # pre-stall reading and a live one now -- a feed that died mid-stop
+        # (driver swap away from this PC) fails the check and falls through
+        # to stall-time inference.
+        measured_fill = None
+        if (
+            state._measured_stall_entry_fuel is not None
+            and state.measured_fuel_l is not None
+            and state.measured_fuel_l > state._measured_stall_entry_fuel + 0.5
+        ):
+            measured_fill = state.measured_fuel_l - state._measured_stall_entry_fuel
+
+        if measured_fill is not None:
+            fuel_added = measured_fill
+            fuel_time = fuel_added / ref.refuel_rate_l_per_s
+            tyre_change = (service_time - fuel_time) >= min_tyre_stop
+        else:
+            # tyre change detection: is the stop long enough for tyres at all?
+            tyre_change = service_time >= min_tyre_stop
+            fuel_time = service_time - (ref.tyre_change_time_s if tyre_change else 0.0)
+            fuel_added = max(0.0, fuel_time * ref.refuel_rate_l_per_s)
+            # A stop can be long for reasons that aren't fuel (driver swap,
+            # repairs, waiting out a penalty) -- never infer more than the
+            # tank can hold.
+            fuel_added = min(fuel_added, ref.tank_capacity_l)
+            # refuel and tyre change run concurrently in most GT3 series? In
+            # iRacing they are sequential for fixed stops; if fuel_time went
+            # negative the stop was tyres-only length.
+            if tyre_change and fuel_time <= 0:
+                fuel_added = 0.0
 
         if state.was_towed:
             cls = StopClass.DAMAGE
@@ -724,7 +925,9 @@ class PitPredictionEngine:
         if stint.stint_number == 1:
             observed_burn = ref.tank_capacity_l / effective_laps
             # underfuelled-start hedge: blend toward reference
-            pace_ref = reference_burn_for_pace(ref, stint.avg_lap_time_s)
+            pace_ref = reference_burn_for_pace(
+                ref, stint.avg_lap_time_s, state.pace_baseline_s
+            )
             observed_burn = (
                 self.stint1_prior_weight * pace_ref
                 + (1 - self.stint1_prior_weight) * observed_burn
@@ -738,7 +941,11 @@ class PitPredictionEngine:
                 return
             observed_burn = pit.inferred_fuel_added_l / effective_laps
 
-        pace_adjusted_ref = reference_burn_for_pace(ref, stint.avg_lap_time_s)
+        # Same anchor the prediction will use, so the factor stays a like-for-like
+        # ratio: observed burn over what the model expected at that pace.
+        pace_adjusted_ref = reference_burn_for_pace(
+            ref, stint.avg_lap_time_s, state.pace_baseline_s
+        )
         if pace_adjusted_ref <= 0:
             return
         new_factor = observed_burn / pace_adjusted_ref
@@ -762,9 +969,15 @@ class PitPredictionEngine:
         session_time_remaining_s: Optional[float],
         now: datetime,
     ) -> PitPrediction:
-        pace = state.rolling_avg_lap_time_s or ref.baseline_lap_time_s
-        ref_burn = reference_burn_for_pace(ref, pace)
+        pace = state.rolling_pace_s or ref.baseline_lap_time_s
+        ref_burn = reference_burn_for_pace(ref, pace, state.pace_baseline_s)
         effective_burn = ref_burn * state.personal_burn_factor
+        # Own car with a live gauge: fuel on board is read, not inferred, and
+        # once enough green laps are sampled the burn is measured too.
+        measured_fuel = state.measured_fuel_l is not None
+        measured_burn = state.measured_burn_l_per_lap if measured_fuel else None
+        if measured_burn is not None:
+            effective_burn = measured_burn
         if self._is_yellow:
             # burn right now is reduced; projection still uses green burn for
             # remaining laps, which is the conservative (earlier) estimate
@@ -792,9 +1005,16 @@ class PitPredictionEngine:
         usable = fuel_remaining - self.fuel_reserve_l
         laps_of_fuel = max(0.0, usable / effective_burn) if effective_burn > 0 else 0.0
 
-        burn_unc = ref.burn_stddev * (2.0 - state.personal_burn_confidence)
-        if state.anchor_uncertain:
-            burn_unc *= 2.0  # stale anchor -> much wider band
+        if measured_burn is not None:
+            # band from the actual lap-to-lap spread of the measured burns --
+            # traffic and fuel-save variation, not model uncertainty
+            burn_unc = max(
+                self.MEASURED_BURN_UNC_FLOOR_L, pstdev(state.measured_burns)
+            )
+        else:
+            burn_unc = ref.burn_stddev * (2.0 - state.personal_burn_confidence)
+            if state.anchor_uncertain and not measured_fuel:
+                burn_unc *= 2.0  # stale anchor -> much wider band
         low = max(0.0, usable / (effective_burn + burn_unc)) if usable > 0 else 0.0
         high = max(0.0, usable / max(0.1, effective_burn - burn_unc)) if usable > 0 else 0.0
 
@@ -812,10 +1032,15 @@ class PitPredictionEngine:
             if state.stints_observed == 1
             else PredictionBasis.MULTI_OBSERVATION
         )
+        if measured_fuel:
+            basis = PredictionBasis.MEASURED
 
         confidence = state.personal_burn_confidence
-        if state.anchor_uncertain:
+        if state.anchor_uncertain and not measured_fuel:
             confidence = min(confidence, 0.25)
+        if measured_fuel:
+            # fuel on board is exact; residual uncertainty is only the burn
+            confidence = 0.95 if measured_burn is not None else max(confidence, 0.6)
 
         # --- Race-finish strategy: stops remaining and last-fill size ---
         stops_remaining = final_fill = fuel_to_finish = save_to_skip = None
@@ -859,13 +1084,31 @@ class PitPredictionEngine:
         )
 
     def _fuel_remaining(
-        self, state: CompetitorState, ref: CarTrackReference, effective_burn: float
+        self,
+        state: CompetitorState,
+        ref: CarTrackReference,
+        effective_burn: float,
+        ignore_measured: bool = False,
     ) -> float:
+        # The gauge, when live, IS fuel on board -- mid-lap, under yellow,
+        # always. ignore_measured exists for the shadow inference (validation)
+        # and for stint-close leftover, where "fuel now" is post-refuel.
+        if not ignore_measured and state.measured_fuel_l is not None:
+            return state.measured_fuel_l
         yellow_credit = state.yellow_laps * (1 - ref.yellow_burn_multiplier)
+        # Fuel burns continuously but the lap counter only ticks at the line.
+        # Without the lap in progress the estimate reads up to a full lap of
+        # fuel too high just before the line -- always optimistically, and
+        # worst exactly where it matters, on the lap a car has to commit to
+        # pitting. (The anchor after a stop carries a matching fraction, the
+        # pit exit point; it is a few percent of a lap and left uncorrected.)
+        partial = state.last_lap_dist_pct
         if state.stints_observed == 0 and state.last_pit_lap == 0:
-            laps_done = max(0, state.current_lap - 1) - yellow_credit
+            laps_done = max(0, state.current_lap - 1) + partial - yellow_credit
             return ref.tank_capacity_l - laps_done * effective_burn
-        laps_since_pit = max(0, state.current_lap - state.last_pit_lap) - yellow_credit
+        laps_since_pit = (
+            max(0, state.current_lap - state.last_pit_lap) + partial - yellow_credit
+        )
         start_fuel = state.last_stop_fuel_added_l or ref.tank_capacity_l
         return start_fuel - laps_since_pit * effective_burn
 
@@ -910,7 +1153,7 @@ class PitPredictionEngine:
             return {}
         own_ref = self._reference_for(own)
         own_pit_debt = self._remaining_pit_time_s(own_pred, own_ref)
-        own_pace = own.rolling_avg_lap_time_s or own_ref.baseline_lap_time_s
+        own_pace = own.rolling_pace_s or own_ref.baseline_lap_time_s
         own_prog = own.current_lap + own.last_lap_dist_pct
         laps_rem = (session_time_remaining_s / own_pace
                     if session_time_remaining_s and own_pace else 0.0)
@@ -925,7 +1168,7 @@ class PitPredictionEngine:
             if p is None:
                 continue
             ref = self._reference_for(rival)
-            pace = rival.rolling_avg_lap_time_s or ref.baseline_lap_time_s
+            pace = rival.rolling_pace_s or ref.baseline_lap_time_s
             # >0: we are ahead on track (seconds)
             gap_s = (own_prog - (rival.current_lap + rival.last_lap_dist_pct)) * pace
             pit_debt = self._remaining_pit_time_s(p, ref)

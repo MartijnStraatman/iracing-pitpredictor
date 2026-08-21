@@ -145,7 +145,14 @@ for post-race analysis. For HTTPS put Caddy in front:
 
 Flags:
     --refs    reference table; track rows inherit car-level fields
-              (tank capacity etc.) from the car's "*" wildcard row
+              (tank capacity etc.) from the car's "*" wildcard row.
+              car_id and track_id are matched EXACTLY against the session
+              YAML: car_id is CarPath ("ferrari296gt3"), track_id is
+              TrackName -- track folder plus config, lowercase, space
+              separated ("spa grandprix", "spielberg gp"), not the display
+              name ("Red Bull Ring"). A car with no matching row falls back
+              to generic GT3 numbers, so watch the event log at startup: it
+              names every miss and quotes the exact string to paste in.
     --state   persists burn factors + stint anchors; enables full mid-race
               recovery after a crash (same subsession) and warm-starts
               known drivers in future races
@@ -160,19 +167,39 @@ under the header:
 
     OWN-CAR CHECK: model 42.1L vs actual 40.8L (d +1.3L)  |  burn 3.45 vs 3.51 L/lap (d-0.06)
 
-It runs the same fuel inference used for competitors on your car and
-compares it against your real FuelLevel -- burn delta near zero means the
-reference row for your car/track is well tuned. Session rotation
+Your own car's PREDICTION does not use that inference: whenever your
+FuelLevel reading is live, fuel on board is read straight from the gauge
+and burn from the median of your last few green laps -- the row shows
+basis MEASURED at high confidence, and a practice run on a partial load
+is predicted correctly. The check line keeps running the competitor-style
+inference as a shadow model and scores it against the gauge. Burn delta
+near zero means the reference row for your car/track is well tuned; the
+"actual" burn figure is the number to paste into baseline_burn_l_per_lap.
+The measured laps also continuously calibrate the shadow model, so when
+the gauge dies (teammate driving, see below) predictions degrade to an
+inference that has been trained on your real consumption. Session rotation
 (practice -> qualifying -> race) and car resets are handled automatically;
 burn factors carry across, stint tracking restarts.
 
 ## Team races
 
-Run the client on ONE PC only -- any connected team member works, including
-a spotter who never drives (PlayerCarIdx points to the team car for
-everyone). If that PC must change mid-race, just start the client on the
-new machine with the same --server/--token: it pulls the recovery state
-from the relay automatically and continues where the old PC left off.
+FuelLevel is cockpit telemetry: it is only live on the PC of the member
+currently driving. For a two-driver lineup, run the client on BOTH
+drivers' PCs with the same --server/--token. Each client stamps its
+uploads with whether its own member is in the car, and the relay keeps
+the active driver's feed and drops the passive one -- so the dashboard
+always follows the client that can see the real fuel gauge, and the feed
+hands over automatically at every driver swap. The passive client keeps
+its engine warm from the shared telemetry (competitor inference needs no
+cockpit data), so nothing is lost in the handover; its own-car numbers
+just run on the calibrated inference until its driver climbs back in.
+
+A client on a non-driving member's PC (spotter setup) still works, but
+its own-car predictions stay inference-based the whole race -- the gauge
+never goes live there. If a PC must change mid-race, start the client on
+the new machine with the same --server/--token: it pulls the recovery
+state from the relay automatically and continues where the old PC left
+off.
 
 ## Notes
 
