@@ -39,10 +39,11 @@ not the short name. To read both off a live session:
 print(repr(ir['WeekendInfo']['TrackName']));\
 print(sorted({d['CarPath'] for d in ir['DriverInfo']['Drivers']}))"
 
-Rows with track_id "*" act as car-level fallbacks for unknown tracks. A row
-you need but do not have is reported in the event log at startup -- an
-unmatched car silently falls back to generic GT3 numbers, which is a ~30%
-error on every prediction for it, so the misses are worth reading.
+Every row is a complete standalone entry for one (car, track) pair; there
+are no wildcard/fallback rows. A row you need but do not have is reported in
+the event log at startup -- an unmatched car falls back to generic GT3
+numbers, which is a ~30% error on every prediction for it, so the misses are
+worth reading.
 """
 
 from __future__ import annotations
@@ -175,10 +176,13 @@ def load_references(
     """
     Load reference rows keyed by 'car_id|track_id'.
 
-    Track-specific rows inherit any missing fields from the same car's
-    wildcard row (track_id "*"). Put car-level properties -- tank_capacity_l,
-    refuel_rate_l_per_s, tyre_change_time_s -- in the wildcard row once, and
-    keep track rows down to the track-dependent numbers (burn rates, lap time).
+    Every row is standalone: one complete entry per (car, track) pair,
+    carrying the car numbers (tank_capacity_l, refuel_rate_l_per_s,
+    tyre_change_time_s) alongside the track numbers (burn rates, lap time).
+    There is no wildcard/inheritance -- burn per lap is a track property
+    (Le Mans and Lime Rock differ by 3x), so a car-level burn number was
+    never meaningful, and a (car, track) pair without a row now fails loudly
+    instead of quietly running on a car-level guess.
 
     Returns (references, gaps), where gaps maps the same keys to the
     REQUIRED_REF_FIELDS the file never set for that row -- reported by the
@@ -206,19 +210,19 @@ def load_references(
     rows = [{k: v for k, v in row.items() if k in valid} for row in data]
     for i, row in enumerate(rows):
         if "car_id" not in row or "track_id" not in row:
+            raise ValueError(f"{path}: row {i} needs both car_id and track_id")
+        if row["track_id"] == "*":
             raise ValueError(
-                f"{path}: row {i} needs both car_id and track_id "
-                f'(use "track_id": "*" for a car-level fallback row)'
+                f"{path}: wildcard rows (track_id \"*\") are no longer "
+                f"supported -- give '{row['car_id']}' one complete row per "
+                f"track instead (copy the tank/refuel/tyre numbers into each)."
             )
 
-    wildcards = {r["car_id"]: r for r in rows if r["track_id"] == "*"}
     for row in rows:
-        base = wildcards.get(row["car_id"], {})
-        merged = {**base, **row}
-        ref = CarTrackReference(**merged)
+        ref = CarTrackReference(**row)
         key = f"{ref.car_id}|{ref.track_id}"
         refs[key] = ref
-        missing = [f for f in REQUIRED_REF_FIELDS if f not in merged]
+        missing = [f for f in REQUIRED_REF_FIELDS if f not in row]
         if missing:
             gaps[key] = missing
     return refs, gaps
@@ -231,7 +235,7 @@ def make_reference_provider(
     on_warn: Optional[Callable[[str], None]] = None,
 ):
     """
-    Resolve a car's reference row: exact car+track, else the car's '*' row.
+    Resolve a car's reference row by exact car+track match -- nothing else.
 
     A miss used to return None and say nothing, which is the worst way for
     this to fail: the engine falls back to generic GT3 numbers and keeps
@@ -252,22 +256,15 @@ def make_reference_provider(
         car = state.car_id
         if not car:
             return None  # roster not loaded yet; asked again on the next refresh
-        exact, wild = f"{car}|{track_id}", f"{car}|*"
-        key = exact if exact in refs else wild if wild in refs else None
-        if key is None:
+        key = f"{car}|{track_id}"
+        if key not in refs:
             warn(
-                f"WARNING: no reference row for '{car}' -- falling back to generic "
-                f"GT3 ({default.tank_capacity_l:.0f}L, "
+                f"WARNING: no reference row for '{car}' at '{track_id}' -- "
+                f"falling back to generic GT3 ({default.tank_capacity_l:.0f}L, "
                 f"{default.baseline_burn_l_per_lap} L/lap). Add a row with "
                 f'"car_id": "{car}", "track_id": "{track_id}".'
             )
             return None
-        if key == wild:
-            warn(
-                f"WARNING: no row for '{car}' at '{track_id}' -- using the "
-                f"'{car}|*' fallback. Add a row with "
-                f'"track_id": "{track_id}" to references.json.'
-            )
         if gaps.get(key):
             warn(
                 f"WARNING: reference '{key}' never sets "
@@ -370,6 +367,9 @@ class IRacingSource:
                         "team_id": d.get("TeamID", 0),
                         "name": d.get("TeamName") or d.get("UserName", f"Car {d.get('CarIdx')}"),
                         "car_id": d.get("CarPath", ""),
+                        "car_name": d.get("CarScreenNameShort")
+                        or d.get("CarScreenName")
+                        or d.get("CarPath", ""),
                         "car_number": d.get("CarNumber", ""),
                         "class_id": str(d.get("CarClassID", "")),
                         "is_pace_car": d.get("CarIsPaceCar", 0) == 1,
@@ -381,20 +381,87 @@ class IRacingSource:
             return {}
 
 
-class DemoSource:
-    """Simulated 3-car session so the display can be tested without iRacing."""
+DEMO_CAR_NAMES = {
+    "acuransxevo22gt3": "Acura NSX GT3 EVO 22",
+    "amvantageevogt3": "Aston Martin Vantage GT3 EVO",
+    "audir8lmsevo2gt3": "Audi R8 LMS EVO II GT3",
+    "bmwm4gt3": "BMW M4 GT3",
+    "bmwm4gt3evo": "BMW M4 GT3 EVO",
+    "chevyvettez06rgt3": "Chevrolet Corvette Z06 GT3.R",
+    "ferrari296gt3": "Ferrari 296 GT3",
+    "fordmustanggt3": "Ford Mustang GT3",
+    "lamborghinievogt3": "Lamborghini Huracan GT3 EVO",
+    "mclaren720sgt3": "McLaren 720S GT3 EVO",
+    "mercedesamgevogt3": "Mercedes-AMG GT3 2020",
+    "porsche992rgt3": "Porsche 911 GT3 R",
+}
 
-    def __init__(self):
+
+class DemoSource:
+    """Simulated session so the display can be tested without iRacing.
+
+    Given loaded references, the grid is built FROM the file: one car per
+    reference row, using that row's real car_id, tank, burn and lap time --
+    so the engine races the same field the reference file describes.
+    Without references it falls back to a built-in 3-Ferrari sample."""
+
+    def __init__(self, refs: Optional[Dict[str, CarTrackReference]] = None):
         self.t0 = time.monotonic()
-        self.cars = [
-            {"lap_time": 138.0, "pit_on_lap": 27, "stop_s": 58},
-            {"lap_time": 139.5, "pit_on_lap": 26, "stop_s": 61},
-            {"lap_time": 140.2, "pit_on_lap": 28, "stop_s": 55},
-        ]
         self.speedup = 60  # 1 real second = 1 simulated minute
+        self._epoch = datetime.utcnow()
+        self.track_id = "demo_spa"
+        self.track_display = "Circuit de Spa-Francorchamps (Demo)"
+        self.player_idx = 0
+        rows = []
+        if refs:
+            rows = sorted(
+                (r for r in refs.values()
+                 if not r.car_id.startswith(("VERIFY", "FILL"))),
+                key=lambda r: r.car_id,
+            )
+        if rows:
+            self.track_id = rows[0].track_id
+            self.track_display = f"{rows[0].track_id} (demo from references)"
+            self.player_idx = next(
+                (i for i, r in enumerate(rows)
+                 if r.car_id == "mercedesamgevogt3"), 0)
+            self.cars = []
+            for i, r in enumerate(rows):
+                # spread the field a little and stagger the pit windows so
+                # the tower shuffles and stops don't all land on one lap
+                laps_on_tank = int(r.tank_capacity_l
+                                   / r.baseline_burn_l_per_lap * 0.94)
+                self.cars.append({
+                    "lap_time": r.baseline_lap_time_s + (i % 5) * 0.35,
+                    "pit_on_lap": max(3, laps_on_tank - (i % 4)),
+                    "stop_s": r.fixed_pit_overhead_s + r.tyre_change_time_s
+                    + 0.9 * r.tank_capacity_l / r.refuel_rate_l_per_s,
+                    "car_id": r.car_id,
+                    "car_name": DEMO_CAR_NAMES.get(r.car_id, r.car_id),
+                    "tank": r.tank_capacity_l,
+                    "burn": r.baseline_burn_l_per_lap,
+                })
+        else:
+            self.cars = [
+                {"lap_time": 138.0, "pit_on_lap": 27, "stop_s": 58,
+                 "car_id": "ferrari296gt3",
+                 "car_name": ["Ferrari 296 GT3", "Porsche 911 GT3 R",
+                              "BMW M4 GT3"][i % 3],
+                 "tank": 104.0, "burn": 3.55}
+                for i in range(3)
+            ]
+            self.cars[1].update({"lap_time": 139.5, "pit_on_lap": 26, "stop_s": 61})
+            self.cars[2].update({"lap_time": 140.2, "pit_on_lap": 28, "stop_s": 55})
 
     def ensure_connected(self):
         return True
+
+    def sim_now(self) -> datetime:
+        """Simulated wall clock. The engine times pit stalls in wall time,
+        so the 60x-compressed demo must hand it a 60x clock -- otherwise a
+        64 s stop lasts ~1 real second and classifies as a tow."""
+        sim_t = (time.monotonic() - self.t0) * self.speedup
+        return self._epoch + timedelta(seconds=sim_t)
 
     def frame(self) -> dict:
         sim_t = (time.monotonic() - self.t0) * self.speedup
@@ -427,31 +494,33 @@ class DemoSource:
             "SessionTimeRemain": max(0, 3 * 3600 - sim_t),
             "SessionNum": 0,
             "FuelLevel": self._demo_fuel(sim_t),
-            "PlayerCarIdx": 0,
+            "PlayerCarIdx": self.player_idx,
             "IsOnTrack": True,
         }
 
     def _demo_fuel(self, sim_t: float) -> float:
-        # burn continuously, refill when car 0's demo stop completes -- so the
-        # measured-fuel path sees a realistic gauge, refuel jump included
-        car = self.cars[0]
+        # burn continuously, refill when our car's demo stop completes -- so
+        # the measured-fuel path sees a realistic gauge, refuel jump included
+        car = self.cars[self.player_idx]
         pit_end = car["pit_on_lap"] * car["lap_time"] + 8 + car["stop_s"]
         since_fill = sim_t - pit_end if sim_t >= pit_end else sim_t
-        return max(2.0, 104 - (since_fill / car["lap_time"]) * 3.55)
+        return max(2.0, car["tank"] - (since_fill / car["lap_time"]) * car["burn"])
 
     def session_info(self) -> dict:
         return {
-            "track_id": "demo_spa",
-            "track_display": "Circuit de Spa-Francorchamps (Demo)",
+            "track_id": self.track_id,
+            "track_display": self.track_display,
             "session_type": "Race",
-            "player_car_idx": 0,
+            "player_car_idx": self.player_idx,
             "session_id": "demo",
             "drivers": [
-                {"car_idx": i, "cust_id": 1000 + i, "name": f"Demo Team {i + 1}",
+                {"car_idx": i, "cust_id": 1000 + i,
+                 "name": f"Demo {c['car_name'].split()[0]}",
                  "team_id": 9000 + i,
-                 "car_id": "ferrari296gt3", "car_number": str(11 * (i + 1)),
+                 "car_id": c["car_id"], "car_number": str(i + 2),
+                 "car_name": c["car_name"],
                  "class_id": "gt3", "is_pace_car": False}
-                for i in range(len(self.cars))
+                for i, c in enumerate(self.cars)
             ],
         }
 
@@ -463,17 +532,49 @@ class DemoSource:
 class ConsoleDisplay:
     """ANSI live table + scrolling event log. No dependencies."""
 
+    # Where the fuel numbers for a row come from, in plain words.
+    BASIS_LABELS = {
+        "MEASURED": "our fuel gauge",
+        "MULTI_OBSERVATION": "watched 2+ pit stops",
+        "SINGLE_OBSERVATION": "watched 1 pit stop",
+        "PRIOR_ONLY": "no pit stops yet",
+    }
+
+    PIT_STATE_LABELS = {
+        "RACING": "on track",
+        "ENTERING": "pit entry",
+        "IN_STALL": "in pits",
+        "EXITING": "pit exit",
+    }
+
+    # Pit stop classifications for the event log, in plain words.
+    STOP_LABELS = {
+        "FUEL_AND_TYRES": "fuel and tyres",
+        "FUEL_ONLY": "fuel only, no tyres",
+        "TYRES_ONLY": "tyres only, no fuel",
+        "SPLASH": "small splash of fuel",
+        "DRIVE_THROUGH": "drive-through penalty",
+        "DAMAGE": "repair or tow",
+    }
+
     def __init__(self, max_log: int = 8):
         self.log: List[str] = []
         self.max_log = max_log
         self.names: Dict[int, str] = {}
         self.numbers: Dict[int, str] = {}
+        self.brands: Dict[int, str] = {}
+        self.own_car: str = ""
 
-    def set_roster(self, drivers: List[dict]) -> None:
+    def set_roster(self, drivers: List[dict], player_car_idx: Optional[int] = None) -> None:
         for d in drivers:
             if d["car_idx"] is not None:
-                self.names[d["car_idx"]] = d["name"][:22]
+                self.names[d["car_idx"]] = d["name"][:20]
                 self.numbers[d["car_idx"]] = d.get("car_number", "")
+                car_name = d.get("car_name") or d.get("car_id") or ""
+                # manufacturer only ("Porsche 911 GT3 R" -> "Porsche")
+                self.brands[d["car_idx"]] = car_name.split()[0][:12] if car_name else ""
+                if player_car_idx is not None and d["car_idx"] == player_car_idx:
+                    self.own_car = car_name
 
     def add_event(self, msg: str) -> None:
         stamp = datetime.now().strftime("%H:%M:%S")
@@ -490,41 +591,78 @@ class ConsoleDisplay:
         validation_line: str = "",
     ) -> None:
         lines = []
-        status = "CONNECTED" if connected else "WAITING FOR IRACING..."
+        status = "connected" if connected else "waiting for the sim..."
         remain = self._fmt_duration(session_time_remain)
         up = f"   |   relay: {uplink_status}" if uplink_status else ""
-        lines.append(f"  PIT PREDICTOR   |   {status}   |   session remaining: {remain}{up}")
+        our_car = f"   |   our car: {self.own_car}" if self.own_car else ""
+        lines.append(
+            f"  PIT PREDICTOR{our_car}   |   iRacing: {status}"
+            f"   |   race time left: {remain}{up}"
+        )
         if validation_line:
             lines.append(validation_line)
         lines.append("")
-        header = (
-            f"  {'#':>4} {'Team/Driver':<22} {'Lap':>4} {'State':<9} "
-            f"{'Fuel laps':>9} {'Pit lap':>8} {'Window':>9} {'Pit in':>8} "
-            f"{'Stops':>6} {'Conf':>5}  Basis"
+        header1 = (
+            f"  {'Car':>4} {'Team/Driver':<20} {'Car':<12} {'Lap':>4} {'Where':<9} "
+            f"{'Avg lap':>8} {'Best':>8} "
+            f"{'Fuel left':>9} {'Next pit':>8} {'Pit lap':>9} {'Time to':>8} "
+            f"{'Stops':>6} {'Conf':>5}  Fuel estimate"
         )
-        lines.append(header)
-        lines.append("  " + "-" * (len(header) - 2))
+        header2 = (
+            f"  {'#':>4} {'':<20} {'brand':<12} {'now':>4} {'':<9} "
+            f"{'(last 5)':>8} {'lap':>8} "
+            f"{'(laps)':>9} {'on lap':>8} {'window':>9} {'pit':>8} "
+            f"{'left':>6} {'%':>5}  based on"
+        )
+        lines.append(header1)
+        lines.append(header2)
+        lines.append("  " + "-" * (len(header1) - 2))
 
         preds = sorted(predictions, key=lambda p: p.laps_of_fuel_remaining)
         for p in preds:
             state = engine.competitors.get(p.car_idx)
-            pit_state = state.pit_state.value if state else "?"
+            raw_state = state.pit_state.value if state else "?"
+            pit_state = self.PIT_STATE_LABELS.get(raw_state, raw_state)
             name = self.names.get(p.car_idx, f"Car {p.car_idx}")
             num = self.numbers.get(p.car_idx, "")
+            brand = self.brands.get(p.car_idx, "")
+            recent = state.lap_times[-5:] if state and state.lap_times else []
+            avg_lap = self._fmt_lap(sum(recent) / len(recent) if recent else 0.0)
+            best_lap = self._fmt_lap(state.best_lap_time_s if state else 0.0)
             window = f"{p.predicted_pit_lap_min}-{p.predicted_pit_lap_max}"
             pit_in = self._fmt_eta(p.predicted_pit_time)
             urgent = "->" if p.laps_of_fuel_remaining <= 3 else "  "
             stops = self._fmt_stops(p)
+            basis = self.BASIS_LABELS.get(p.basis.value, p.basis.value)
             lines.append(
-                f"{urgent}{num:>4} {name:<22} {state.current_lap if state else 0:>4} "
-                f"{pit_state:<9} {p.laps_of_fuel_remaining:>9.1f} "
+                f"{urgent}{num:>4} {name:<20} {brand:<12} "
+                f"{state.current_lap if state else 0:>4} "
+                f"{pit_state:<9} {avg_lap:>8} {best_lap:>8} "
+                f"{p.laps_of_fuel_remaining:>9.1f} "
                 f"{p.predicted_pit_lap:>8} {window:>9} {pit_in:>8} "
-                f"{stops:>6} {p.confidence:>5.0%}  {p.basis.value}"
+                f"{stops:>6} {p.confidence:>5.0%}  {basis}"
             )
 
         if not preds:
             lines.append("  (no cars tracked yet)")
 
+        lines.append("")
+        lines.append(
+            "  How to read this: each car has enough fuel for 'Fuel left' more laps"
+            " and must pit around 'Next pit on lap' (window = earliest to latest)."
+        )
+        lines.append(
+            "  'Avg lap' = average of that car's last 5 racing laps"
+            " (laps behind the safety car don't count).  'Best lap' = fastest of the session."
+        )
+        lines.append(
+            "  'Stops left' = pit stops still needed to reach the finish"
+            "  (s: last stop is only a splash of fuel,  *: saving fuel could skip it)."
+        )
+        lines.append(
+            "  '->' at the line start = that car has to pit within 3 laps."
+            "  'Conf %' = how much to trust the numbers on that line."
+        )
         lines.append("")
         lines.append("  Recent events:")
         for entry in self.log or ["  (none)"]:
@@ -546,6 +684,14 @@ class ConsoleDisplay:
         elif p.final_stop_fill_l is not None and p.final_stop_fill_l < 30:
             tag = "s"
         return f"{p.stops_remaining}{tag}"
+
+    @staticmethod
+    def _fmt_lap(seconds: Optional[float]) -> str:
+        """Lap time as m:ss.t, or '-' when no lap has been recorded yet."""
+        if not seconds or seconds <= 0:
+            return "-"
+        m, s = divmod(seconds, 60)
+        return f"{int(m)}:{s:04.1f}"
 
     @staticmethod
     def _fmt_eta(ts: Optional[datetime]) -> str:
@@ -572,21 +718,23 @@ class ConsoleDisplay:
 def describe_pit(evt: PitStopEvent, display: ConsoleDisplay) -> str:
     name = display.names.get(evt.car_idx, f"Car {evt.car_idx}")
     if evt.classified_as.value == "DRIVE_THROUGH":
-        return f"{name}: drive-through penalty"
+        return f"{name}: drive-through penalty (no service)"
+    kind = ConsoleDisplay.STOP_LABELS.get(
+        evt.classified_as.value, evt.classified_as.value
+    )
     return (
-        f"{name}: pit stop {evt.stall_duration_s:.0f}s in stall, "
-        f"~{evt.inferred_fuel_added_l:.0f}L"
-        f"{' + tyres' if evt.inferred_tyre_change else ''} "
-        f"({evt.classified_as.value})"
+        f"{name}: pitted for {evt.stall_duration_s:.0f}s -- {kind}, "
+        f"took ~{evt.inferred_fuel_added_l:.0f}L of fuel"
     )
 
 
 def describe_stint(evt: StintEvent, display: ConsoleDisplay) -> str:
     name = display.names.get(evt.car_idx, f"Car {evt.car_idx}")
     return (
-        f"{name}: stint {evt.stint_number} ended, laps {evt.start_lap}-{evt.end_lap} "
-        f"({evt.green_laps} green / {evt.yellow_laps} yellow), "
-        f"burn {evt.inferred_burn_l_per_lap:.2f} L/lap"
+        f"{name}: finished stint {evt.stint_number} "
+        f"(laps {evt.start_lap}-{evt.end_lap}, "
+        f"{evt.green_laps} green / {evt.yellow_laps} yellow), "
+        f"used {evt.inferred_burn_l_per_lap:.2f}L of fuel per lap"
     )
 
 
@@ -624,7 +772,15 @@ class GroundTruthValidator:
         model_fuel = engine.estimated_fuel_l(idx)
         if model_fuel is None:
             return
-        parts = [f"model {model_fuel:5.1f}L vs actual {fuel:5.1f}L (d{model_fuel - fuel:+5.1f}L)"]
+        diff = model_fuel - fuel
+        if abs(diff) < 0.3:
+            verdict = "spot on"
+        else:
+            verdict = f"{abs(diff):.1f}L too {'high' if diff > 0 else 'low'}"
+        parts = [
+            f"it estimated {model_fuel:.1f}L in our tank, the gauge shows {fuel:.1f}L"
+            f" -> {verdict}"
+        ]
         if self.actual_burns:
             actual_burn = sum(self.actual_burns) / len(self.actual_burns)
             state = engine.competitors.get(idx)
@@ -634,8 +790,16 @@ class GroundTruthValidator:
                 model_burn = reference_burn_for_pace(
                     ref, pace, state.pace_baseline_s
                 ) * state.personal_burn_factor
-                parts.append(f"burn {model_burn:.2f} vs {actual_burn:.2f} L/lap (d{model_burn - actual_burn:+.2f})")
-        self.line = "  OWN-CAR CHECK: " + "  |  ".join(parts)
+                parts.append(
+                    f"estimated {model_burn:.2f}L used per lap, really {actual_burn:.2f}L"
+                )
+        self.line = (
+            "  SELF-TEST: rivals' fuel is invisible, so it is estimated from laps"
+            " driven, pace and pit stop lengths. The same estimate, done for our"
+            " car and\n             checked against the real gauge: "
+            + "  |  ".join(parts)
+            + "   (small error = the table below can be trusted)"
+        )
 
 
 def _persist_id(d: dict) -> int:
@@ -740,7 +904,6 @@ def main() -> int:
     ap.add_argument("--token", help="INGEST_TOKEN for the relay")
     args = ap.parse_args()
 
-    source = DemoSource() if args.demo else IRacingSource()
     display = ConsoleDisplay()
     validator = GroundTruthValidator()
     uplink = Uplink(args.server, args.token) if args.server and args.token else None
@@ -753,6 +916,10 @@ def main() -> int:
             uplink.send_event(msg)
 
     refs, ref_gaps = load_references(args.refs, warn)
+    # --demo with --refs simulates the field described by the reference file
+    # (real car ids, tanks, burns); without refs it falls back to the
+    # built-in 3-car sample.
+    source = DemoSource(refs if args.refs else None) if args.demo else IRacingSource()
 
     engine: Optional[PitPredictionEngine] = None
     latest_info: dict = {}
@@ -874,7 +1041,7 @@ def main() -> int:
                     eff = (info or {}).get("effective_tank_l")
                     pcar = (info or {}).get("player_car_id", "")
                     if eff and pcar:
-                        row = refs.get(f"{pcar}|{(info or {}).get('track_id')}") or refs.get(f"{pcar}|*")
+                        row = refs.get(f"{pcar}|{(info or {}).get('track_id')}")
                         if row and abs(row.tank_capacity_l - eff) > 2.0:
                             warn(
                                 f"WARNING: reference tank for {pcar} is "
@@ -888,16 +1055,23 @@ def main() -> int:
                         engine.register_competitor(
                             d["car_idx"], _persist_id(d), d["car_id"], d["class_id"]
                         )
-                display.set_roster((info or {}).get("drivers", []))
+                display.set_roster(
+                    (info or {}).get("drivers", []),
+                    player_car_idx=(info or {}).get("player_car_idx"),
+                )
                 latest_info = info or latest_info
 
             if engine:
-                engine.process_frame(frame)
+                # demo compresses time 60x -- the engine must run on the
+                # simulated clock or stall durations collapse to ~1 s
+                sim_now = source.sim_now() if hasattr(source, "sim_now") else None
+                engine.process_frame(frame, sim_now)
                 validator.update(frame, engine)
 
                 if loop_start - last_render >= DISPLAY_EVERY_S:
                     remain = frame.get("SessionTimeRemain")
-                    preds = engine.predict_all(session_time_remaining_s=remain)
+                    preds = engine.predict_all(session_time_remaining_s=remain,
+                                               now=sim_now)
                     display.render(preds, engine, remain, connected=True,
                                    uplink_status=uplink.status if uplink else None,
                                    validation_line=validator.line)

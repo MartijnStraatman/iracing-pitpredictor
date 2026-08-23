@@ -152,16 +152,18 @@ case-sensitively against the session YAML** — there is no normalisation:
   lowercase and space-separated: `spa grandprix`, `spielberg gp`. NOT
   `TrackDisplayName` ("Red Bull Ring") and not the short name.
 
-Track rows inherit missing fields from the car's `"track_id": "*"` wildcard
-row. Car-level properties (tank, refuel rate, tyre time) live once in the
-wildcard; track rows carry the burn/pace numbers. Give the wildcard a
-car-level burn estimate too — it is what an unlisted track falls back on, and
-a wildcard without one falls all the way to the generic 2.8 L/lap default.
+Every row is a complete standalone entry for one (car, track) pair: car
+numbers (tank, refuel rate, tyre time) AND track numbers (burn rates, lap
+time) together, duplicated across a car's rows. Wildcard rows
+(`"track_id": "*"`) are rejected at load time — burn per lap is a track
+property (Le Mans vs Lime Rock differ ~3x), so a car-level burn number was
+never meaningful, and when it was badly wrong the 0.6–1.5 plausibility gate
+in `_calibrate` rejected the correction, locking the error in for the race.
 
 A row you need but do not have used to fail silently: the engine dropped to
 generic GT3 numbers and kept predicting at full confidence, ~30% off. The
 runner now reports each distinct problem once, to both console and dashboard —
-missing car, missing track row, required fields never set (`REQUIRED_REF_FIELDS`
+missing (car, track) row, required fields never set (`REQUIRED_REF_FIELDS`
 in the runner), and unrecognised field names, since a misspelt field is
 indistinguishable from an absent one. Keys prefixed `_` are ignored as
 annotations, which is how you comment a JSON row.

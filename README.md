@@ -139,13 +139,16 @@ for post-race analysis. For HTTPS put Caddy in front:
 
     pip install pyirsdk
     cd client
-    copy references.example.json references.json   (edit for your cars/tracks)
+    copy references.example.json references.json   (edit for your cars/tracks;
+                                  VRS subscribers: tools/README.md documents a
+                                  tool that fills rows from your datapacks)
     python run_pit_predictor.py --refs references.json --state drivers.json ^
         --server http://<server>:8000 --token <INGEST_TOKEN>
 
 Flags:
-    --refs    reference table; track rows inherit car-level fields
-              (tank capacity etc.) from the car's "*" wildcard row.
+    --refs    reference table; one complete row per (car, track) pair --
+              no wildcard rows, every row carries the car's tank/refuel/
+              tyre numbers as well as the track's burn and pace numbers.
               car_id and track_id are matched EXACTLY against the session
               YAML: car_id is CarPath ("ferrari296gt3"), track_id is
               TrackName -- track folder plus config, lowercase, space

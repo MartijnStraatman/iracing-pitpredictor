@@ -201,6 +201,7 @@ class CompetitorState:
     green_laps: int = 0
     yellow_laps: int = 0
     lap_times: List[float] = field(default_factory=list)  # green laps only
+    best_lap_time_s: float = 0.0  # fastest green lap this session (lap_times resets per stint)
 
     # pit state machine
     pit_state: PitState = PitState.RACING
@@ -502,6 +503,7 @@ class PitPredictionEngine:
                 "current_lap": s.current_lap,
                 "green_laps": s.green_laps,
                 "yellow_laps": s.yellow_laps,
+                "best_lap_time_s": round(s.best_lap_time_s, 3),
                 "measured_burns": [round(b, 3) for b in s.measured_burns],
             }
         return out
@@ -533,6 +535,7 @@ class PitPredictionEngine:
                 s.stint_number = data.get("stint_number", 1)
                 s.green_laps = data.get("green_laps", 0)
                 s.yellow_laps = data.get("yellow_laps", 0)
+                s.best_lap_time_s = data.get("best_lap_time_s", 0.0)
                 s.measured_burns = list(data.get("measured_burns", []))
                 s._restored_lap = data.get("current_lap", -1)
             else:
@@ -552,6 +555,7 @@ class PitPredictionEngine:
             state.green_laps = 0
             state.yellow_laps = 0
             state.lap_times = []
+            state.best_lap_time_s = 0.0
             state.last_pit_lap = 0
             state.last_stop_fuel_added_l = 0.0
             state.stint_number = 1
@@ -583,6 +587,11 @@ class PitPredictionEngine:
                     state.lap_times.append(last_lap_time)
                     if len(state.lap_times) > 50:
                         state.lap_times = state.lap_times[-50:]
+                    if (
+                        state.best_lap_time_s <= 0
+                        or last_lap_time < state.best_lap_time_s
+                    ):
+                        state.best_lap_time_s = last_lap_time
         state._last_seen_lap = lap
 
     # -- measured fuel (own car only) ---------------------------------------
