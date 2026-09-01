@@ -1,0 +1,21 @@
+# secrets
+.env
+relay/.env
+
+# VRS browser captures: HARs carry live session cookies -- never commit
+vrs_bodies/
+*.har
+
+# runtime state / captured race data
+client/drivers.json
+client/references.json
+relay/data/*
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+relay/.DS_Store
+!relay/data/.gitkeep
