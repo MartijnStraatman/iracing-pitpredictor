@@ -168,6 +168,12 @@ REQUIRED_REF_FIELDS = (
     "save_burn_l_per_lap",
 )
 
+# Markers the import tools leave behind on an id they could not resolve.
+# Such a row reaches the engine looking real and matches nothing, which is
+# indistinguishable from having no row at all -- so it is dropped at load
+# time and reported, rather than sitting in the file looking like coverage.
+PLACEHOLDER_MARKERS = ("VERIFY", "FILL_ME", "TODO", "?")
+
 
 def load_references(
     path: Optional[str],
@@ -216,6 +222,28 @@ def load_references(
                 f"{path}: wildcard rows (track_id \"*\") are no longer "
                 f"supported -- give '{row['car_id']}' one complete row per "
                 f"track instead (copy the tank/refuel/tyre numbers into each)."
+            )
+    # An id the import tool could not resolve is worse than a missing row: it
+    # never matches a CarPath, so the car runs on generic GT3 numbers while
+    # the file looks complete. Drop those rows and say so -- loudly, but
+    # without refusing to start the client twenty minutes before a race.
+    unresolved = [
+        row for row in rows
+        if any(m in str(row["car_id"]) or m in str(row["track_id"])
+               for m in PLACEHOLDER_MARKERS)
+    ]
+    for row in unresolved:
+        rows.remove(row)
+        if on_warn:
+            on_warn(
+                f"WARNING: {path} has an unresolved id "
+                f"(car_id={row['car_id']!r}, track_id={row['track_id']!r}) -- "
+                f"row ignored, so that car will fall back to generic GT3 "
+                f"numbers. Read the real ids off a live session with: "
+                f"python -c \"import irsdk;ir=irsdk.IRSDK();ir.startup();"
+                f"print(repr(ir['WeekendInfo']['TrackName']));"
+                f"print(sorted({{d['CarPath'] for d in "
+                f"ir['DriverInfo']['Drivers']}}))\""
             )
 
     for row in rows:
@@ -453,6 +481,14 @@ class DemoSource:
             self.cars[1].update({"lap_time": 139.5, "pit_on_lap": 26, "stop_s": 61})
             self.cars[2].update({"lap_time": 140.2, "pit_on_lap": 28, "stop_s": 55})
 
+        # Pre-race grid: the field waits in the pit boxes for the green flag,
+        # each car for a slightly different time. This is the sequence that
+        # fabricated a pit stop (and a different fuel load) per car in the
+        # first live race -- the demo must reproduce it, not skip to lap 1.
+        self.grid_s = 90.0
+        for i, car in enumerate(self.cars):
+            car["box_dwell"] = 30.0 + (i % 5) * 8.0
+
     def ensure_connected(self):
         return True
 
@@ -465,17 +501,36 @@ class DemoSource:
 
     def frame(self) -> dict:
         sim_t = (time.monotonic() - self.t0) * self.speedup
-        on_pit, surface, lap_arr, last = [], [], [], []
+        # The race clock starts at the green flag; before it the field is
+        # parked in the pit boxes. That grid phase is not decoration: reading
+        # the wait for the green as a refuel is what wrecked the first live
+        # race, so the standard demo run has to exercise it.
+        race_t = sim_t - self.grid_s
+        on_pit, surface, lap_arr, last, dist = [], [], [], [], []
+        if race_t < 0:
+            for car in self.cars:
+                in_box = sim_t < car["box_dwell"]
+                on_lane = car["box_dwell"] <= sim_t < car["box_dwell"] + 15
+                on_pit.append(in_box or on_lane)
+                surface.append(TRK_IN_PIT_STALL if in_box else TRK_ON_TRACK)
+                lap_arr.append(0)
+                last.append(-1.0)
+                dist.append(0.0)
+            return self._frame_dict(on_pit, surface, lap_arr, last, dist, race_t)
+
         for car in self.cars:
-            lap = int(sim_t // car["lap_time"]) + 1
+            lap = int(race_t // car["lap_time"]) + 1
             pit_start = car["pit_on_lap"] * car["lap_time"]
-            in_window = pit_start <= sim_t < pit_start + car["stop_s"] + 20
-            in_stall = pit_start + 8 <= sim_t < pit_start + 8 + car["stop_s"]
+            in_window = pit_start <= race_t < pit_start + car["stop_s"] + 20
+            in_stall = pit_start + 8 <= race_t < pit_start + 8 + car["stop_s"]
             on_pit.append(in_window)
             surface.append(TRK_IN_PIT_STALL if in_stall else TRK_ON_TRACK)
             lap_arr.append(min(lap, car["pit_on_lap"]) if in_window else lap)
             last.append(car["lap_time"] + (hash(lap) % 10) / 10)
-        dist = [(sim_t % c["lap_time"]) / c["lap_time"] for c in self.cars]
+        dist = [(race_t % c["lap_time"]) / c["lap_time"] for c in self.cars]
+        return self._frame_dict(on_pit, surface, lap_arr, last, dist, race_t)
+
+    def _frame_dict(self, on_pit, surface, lap_arr, last, dist, race_t) -> dict:
         # race order = laps completed + fraction of the current lap, so the
         # demo tower actually shuffles as the faster cars pull away.
         order = sorted(range(len(self.cars)), key=lambda i: -(lap_arr[i] + dist[i]))
@@ -491,19 +546,19 @@ class DemoSource:
             "CarIdxPosition": positions,
             "CarIdxClassPosition": positions,  # demo field is single-class
             "SessionFlags": 0,
-            "SessionTimeRemain": max(0, 3 * 3600 - sim_t),
+            "SessionTimeRemain": max(0, 3 * 3600 - max(0.0, race_t)),
             "SessionNum": 0,
-            "FuelLevel": self._demo_fuel(sim_t),
+            "FuelLevel": self._demo_fuel(max(0.0, race_t)),
             "PlayerCarIdx": self.player_idx,
             "IsOnTrack": True,
         }
 
-    def _demo_fuel(self, sim_t: float) -> float:
+    def _demo_fuel(self, race_t: float) -> float:
         # burn continuously, refill when our car's demo stop completes -- so
         # the measured-fuel path sees a realistic gauge, refuel jump included
         car = self.cars[self.player_idx]
         pit_end = car["pit_on_lap"] * car["lap_time"] + 8 + car["stop_s"]
-        since_fill = sim_t - pit_end if sim_t >= pit_end else sim_t
+        since_fill = race_t - pit_end if race_t >= pit_end else race_t
         return max(2.0, car["tank"] - (since_fill / car["lap_time"]) * car["burn"])
 
     def session_info(self) -> dict:
@@ -808,10 +863,12 @@ def _persist_id(d: dict) -> int:
     return d.get("team_id") or d.get("cust_id", -1)
 
 
-def _save_snapshot(path: str, engine: PitPredictionEngine, subsession_id: str) -> dict:
+def _save_snapshot(path: str, engine: PitPredictionEngine, subsession_id: str,
+                   session_num: Optional[int] = None) -> dict:
     payload = {
         "type": "state",
         "subsession_id": subsession_id,
+        "session_num": session_num,
         "saved_at": datetime.utcnow().isoformat(),
         "competitors": engine.export_state(),
     }
@@ -841,6 +898,26 @@ def _snapshot_age_s(saved: dict) -> float:
         return (datetime.utcnow() - datetime.fromisoformat(saved["saved_at"])).total_seconds()
     except (KeyError, ValueError):
         return float("inf")
+
+
+def _is_same_session(saved: Optional[dict], sid: str,
+                     session_num: Optional[int]) -> bool:
+    """True only for a snapshot taken in THIS session of this subsession.
+
+    SubSessionID alone is not enough: practice, qualifying and the race all
+    share one, so matching on it restores practice stint anchors into the
+    race -- lap numbers, pit laps and fuel loads that describe a session that
+    no longer exists. SessionNum is what separates them. A snapshot without
+    the field predates this check and is treated as a different session, so
+    it warm-starts burn factors only.
+    """
+    if not saved:
+        return False
+    return (
+        saved.get("subsession_id") == sid
+        and saved.get("session_num") == session_num
+        and _snapshot_age_s(saved) < 6 * 3600
+    )
 
 
 def build_snapshot(
@@ -924,6 +1001,7 @@ def main() -> int:
     engine: Optional[PitPredictionEngine] = None
     latest_info: dict = {}
     session_id_seen: Optional[str] = None
+    session_num_seen: Optional[int] = None
     last_render = 0.0
     last_roster_refresh = 0.0
     last_on_track = -1.0  # monotonic ts our member was last in the car
@@ -1002,14 +1080,10 @@ def main() -> int:
                     saved_from = "local file"
                     if args.state and Path(args.state).exists():
                         saved = json.loads(Path(args.state).read_text())
-                    local_matches = bool(
-                        saved and saved.get("subsession_id") == sid
-                        and _snapshot_age_s(saved) < 6 * 3600
-                    )
+                    local_matches = _is_same_session(saved, sid, session_num)
                     if not local_matches and args.server and args.token:
                         relay_saved = _fetch_relay_state(args.server, args.token)
-                        if (relay_saved and relay_saved.get("subsession_id") == sid
-                                and _snapshot_age_s(relay_saved) < 6 * 3600):
+                        if _is_same_session(relay_saved, sid, session_num):
                             saved = relay_saved
                             saved_from = "relay (handoff from another PC)"
                     if saved:
@@ -1019,23 +1093,21 @@ def main() -> int:
                                 engine.register_competitor(
                                     d["car_idx"], _persist_id(d), d["car_id"], d["class_id"]
                                 )
-                        same = (
-                            saved.get("subsession_id") == sid
-                            and _snapshot_age_s(saved) < 6 * 3600
-                        )
+                        same = _is_same_session(saved, sid, session_num)
                         engine.import_state(
                             saved.get("competitors", saved), same_session=same
                         )
                         display.add_event(
                             f"restored mid-race state via {saved_from}"
                             if same
-                            else "warm-started burn factors from previous race"
+                            else "warm-started burn factors from an earlier session"
                         )
                     engine._session_num = session_num
                     if "_carry" in dir() and _carry:
                         engine.import_state(_carry, same_session=False)
                         _carry = None
                     session_id_seen = sid
+                    session_num_seen = session_num
                     display.add_event(f"session initialised ({(info or {}).get('track_id', 'unknown')})")
                     # BoP sanity check: compare live effective tank vs reference
                     eff = (info or {}).get("effective_tank_l")
@@ -1084,7 +1156,10 @@ def main() -> int:
                             remain,
                         ))
                     if args.state:
-                        payload = _save_snapshot(args.state, engine, session_id_seen or "")
+                        payload = _save_snapshot(
+                            args.state, engine, session_id_seen or "",
+                            session_num_seen,
+                        )
                         if uplink:
                             uplink._put(payload)  # park recovery state on relay
 
@@ -1093,7 +1168,8 @@ def main() -> int:
 
     except KeyboardInterrupt:
         if engine and args.state:
-            _save_snapshot(args.state, engine, session_id_seen or "")
+            _save_snapshot(args.state, engine, session_id_seen or "",
+                           session_num_seen)
             print(f"\nBurn factors saved to {args.state}")
         print("Stopped.")
         return 0

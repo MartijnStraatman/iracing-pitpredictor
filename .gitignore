@@ -9,7 +9,7 @@ vrs_bodies/
 # runtime state / captured race data
 client/drivers.json
 client/references.json
-relay/data/
+relay/data/*
 
 # python
 __pycache__/
@@ -18,3 +18,4 @@ __pycache__/
 venv/
 
 relay/.DS_Store
+!relay/data/.gitkeep

@@ -566,7 +566,22 @@ class PitPredictionEngine:
         # first live lap after a same-session restore: how long were we blind?
         if state._restored_lap >= 0:
             gap = lap - state._restored_lap
-            if gap > 2:
+            if gap < 0:
+                # The lap counter restarted under us. Practice, qualifying and
+                # the race share one SubSessionID, so a snapshot taken in an
+                # earlier session restores as "same session" and its anchors
+                # are numbered against a lap count that no longer exists.
+                # Keep the burn factors, drop everything positional.
+                state.stint_start_lap = lap
+                state.green_laps = 0
+                state.yellow_laps = 0
+                state.lap_times = []
+                state.best_lap_time_s = 0.0
+                state.last_pit_lap = 0
+                state.last_stop_fuel_added_l = 0.0
+                state.stint_number = 1
+                state.anchor_uncertain = False
+            elif gap > 2:
                 # long blackout: the car may have pitted unseen. Count the
                 # missed laps as green so fuel accounting stays continuous,
                 # widen bands, and let missed-pit inference re-anchor.
@@ -686,13 +701,24 @@ class PitPredictionEngine:
         self, state: CompetitorState, on_pit: bool, surface: int, lap: int, now: datetime
     ) -> None:
         towed = surface in (TRK_NOT_IN_WORLD, TRK_OFF_TRACK) and state.pit_state != PitState.RACING
+        # NOT_IN_WORLD covers two very different things: a car being towed, and
+        # a car that simply is not in the session -- sitting in the garage,
+        # not yet joined, disconnected. iRacing reports lap -1 for the latter,
+        # and a car on lap -1 is not racing, so it cannot be being towed.
+        in_world = surface != TRK_NOT_IN_WORLD
+        racing_for_real = lap > 0
 
         if state.pit_state == PitState.RACING:
             if on_pit and self._dwell_ok(state, now):
                 self._set_state(state, PitState.ENTERING, now)
                 state.pit_entry_ts = now
                 state.pending_stint_end_lap = lap
-            elif surface == TRK_NOT_IN_WORLD and state.stint_start_ts is not None:
+            elif (
+                surface == TRK_NOT_IN_WORLD
+                and state.stint_start_ts is not None
+                and racing_for_real
+                and self._dwell_ok(state, now)
+            ):
                 # towed from track: treat as heading to stall, flag damage
                 self._set_state(state, PitState.ENTERING, now)
                 state.pit_entry_ts = now
@@ -718,7 +744,14 @@ class PitPredictionEngine:
                     state.stall_duration_s = (now - state.stall_enter_ts).total_seconds()
 
         elif state.pit_state == PitState.EXITING:
-            if not on_pit:
+            # A car out of the world has not rejoined the track -- closing the
+            # stint here would drop it straight back into RACING, where being
+            # out of the world starts the cycle again. That loop ran at ~1 Hz
+            # for the whole of the first live race: 12,000 phantom stops on one
+            # car, each re-anchoring fuel a lap lower than the last, draining
+            # a full tank to nothing in under a minute. Wait for the car to
+            # actually exist again.
+            if not on_pit and in_world:
                 self._close_stint(state, lap, now)
                 self._set_state(state, PitState.RACING, now)
 
@@ -751,6 +784,35 @@ class PitPredictionEngine:
             cb(evt)
 
     def _close_stint(self, state: CompetitorState, lap: int, now: datetime) -> None:
+        # Pre-green box exit is not a pit stop. Every car starts the race
+        # parked in its pit stall, so the state machine walks stall -> pit
+        # road -> track before the flag drops and reads the wait for the green
+        # as service time: a 36 s wait becomes a 24 L "refuel", a 52 s wait
+        # becomes 64 L, and every car gets its own fabricated anchor. Nothing
+        # corrects it either -- the stint is zero laps long, so _calibrate
+        # bails at `effective_laps < 3` and the whole field sits on
+        # PRIOR_ONLY. A car that has not completed a lap did not pit, it
+        # started: leave stint 1 and its full-tank assumption alone, emit
+        # nothing.
+        #
+        # Both halves of the test come from live telemetry on purpose. The
+        # restorable counters (green_laps, stint_number) cannot answer "has
+        # this car raced yet" after a restore, because a practice snapshot
+        # repopulates them -- the guard would read "18 laps in, this must be
+        # real" and let the grid stop through, now adding its box dwell to a
+        # practice leftover rather than a full tank. `current_lap` is only
+        # ever written from a frame, so on the grid it still says 0.
+        if lap <= 1 and state.current_lap <= 1:
+            state.pit_entry_ts = None
+            state.stall_enter_ts = None
+            state.stall_exit_ts = None
+            state.stall_duration_s = 0.0
+            state.was_towed = False
+            state.pending_stint_end_lap = 0
+            state.stint_start_ts = state.stint_start_ts or now
+            state._measured_stall_entry_fuel = None
+            return
+
         ref = self._reference_for(state)
 
         # Estimate fuel still on board at pit entry (model-derived leftover).
@@ -792,8 +854,11 @@ class PitPredictionEngine:
             # inference above, including the fill-to-full snap
             start_fuel = state.measured_fuel_l
 
-        # roll into new stint
-        state.last_pit_lap = lap
+        # roll into new stint. Clamp the anchor: iRacing reports lap -1 for a
+        # car that is not in the session, and a negative anchor silently adds
+        # a lap of burn to every later estimate for that car
+        # (`current_lap - (-1)`), for the rest of the race.
+        state.last_pit_lap = max(0, lap)
         state.last_stop_fuel_added_l = start_fuel  # semantics: fuel ON BOARD at stint start
         state.stint_number += 1
         state.current_stint_id = str(uuid.uuid4())
@@ -992,6 +1057,11 @@ class PitPredictionEngine:
             # remaining laps, which is the conservative (earlier) estimate
             pass
 
+        if state.last_pit_lap > state.current_lap:
+            # stale anchor (see _fuel_remaining): widen the band rather than
+            # quietly reporting a number built on a lap count that is gone
+            state.anchor_uncertain = True
+
         fuel_remaining = self._fuel_remaining(state, ref, effective_burn)
 
         # Missed-pit inference: if the model says the car ran out of fuel more
@@ -1115,8 +1185,17 @@ class PitPredictionEngine:
         if state.stints_observed == 0 and state.last_pit_lap == 0:
             laps_done = max(0, state.current_lap - 1) + partial - yellow_credit
             return ref.tank_capacity_l - laps_done * effective_burn
+        if state.last_pit_lap > state.current_lap:
+            # The anchor is numbered against a lap count this car no longer
+            # has -- a session rotation or a car reset renumbered underneath
+            # it. max(0, ...) would clamp the difference to zero and freeze
+            # fuel at the stale figure for as many laps as the gap, which is
+            # how a practice anchor survives into a race unnoticed. Fall back
+            # to the no-anchor estimate; `_predict` flags the uncertainty.
+            laps_done = max(0, state.current_lap - 1) + partial - yellow_credit
+            return ref.tank_capacity_l - laps_done * effective_burn
         laps_since_pit = (
-            max(0, state.current_lap - state.last_pit_lap) + partial - yellow_credit
+            state.current_lap - state.last_pit_lap + partial - yellow_credit
         )
         start_fuel = state.last_stop_fuel_added_l or ref.tank_capacity_l
         return start_fuel - laps_since_pit * effective_burn

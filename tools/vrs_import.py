@@ -616,16 +616,41 @@ def _write_out(path: Path, rows: list[dict]) -> None:
 
     stamp = datetime.utcnow().strftime("%Y%m%d-%H%M")
     out = path.with_name(f"{path.stem}-{stamp}{path.suffix or '.json'}")
-    for r in rows:
-        if any(k in (r["car_id"] + r["track_id"]) for k in ("FILL_ME", "VERIFY")):
-            print(f"note: unresolved id in car_id={r['car_id']!r} "
-                  f"track_id={r['track_id']!r} -- written anyway; fix it "
-                  "before the client can match this row.")
+
+    # A row whose id could not be resolved must not sit in the same file as
+    # the good ones. It never matches a CarPath, so the car quietly runs on
+    # generic GT3 numbers while the file looks complete -- which is how a
+    # whole class of cars raced on a 2.8 L/lap prior at a track that burns
+    # 2.41. They go to a separate file the client will not load.
+    clean = [r for r in rows if not _unresolved(r)]
+    unresolved = [r for r in rows if _unresolved(r)]
+
     out.write_text(
-        "[\n" + ",\n".join("  " + json.dumps(r) for r in rows) + "\n]\n",
+        "[\n" + ",\n".join("  " + json.dumps(r) for r in clean) + "\n]\n",
         encoding="utf-8",
     )
-    print(f"\nwrote {len(rows)} row(s) to {out}")
+    print(f"\nwrote {len(clean)} row(s) to {out}")
+
+    if unresolved:
+        review = out.with_name(f"{out.stem}.needs-review{out.suffix}")
+        review.write_text(
+            "[\n" + ",\n".join("  " + json.dumps(r) for r in unresolved) + "\n]\n",
+            encoding="utf-8",
+        )
+        print(f"\n{len(unresolved)} row(s) have an id this tool could not "
+              f"resolve; they are NOT in the file above.")
+        for r in unresolved:
+            print(f"  car_id={r['car_id']!r} track_id={r['track_id']!r}")
+        print(f"held in {review}\n"
+              "Fix the ids against a live session and merge them in by hand:\n"
+              "  python -c \"import irsdk;ir=irsdk.IRSDK();ir.startup();"
+              "print(repr(ir['WeekendInfo']['TrackName']));"
+              "print(sorted({d['CarPath'] for d in ir['DriverInfo']['Drivers']}))\"")
+
+
+def _unresolved(row: dict) -> bool:
+    return any(k in (str(row["car_id"]) + str(row["track_id"]))
+               for k in ("FILL_ME", "VERIFY"))
 
 
 def list_plans(seed_arg: str | None) -> int:

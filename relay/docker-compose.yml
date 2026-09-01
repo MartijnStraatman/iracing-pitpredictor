@@ -2,6 +2,9 @@ services:
   pitwall:
     build: .
     restart: unless-stopped
+    # must match the owner of ./data -- the log append swallows OSError, so a
+    # permission mismatch loses the whole recording without a single error
+    user: "${PUID:-1000}:${PGID:-1000}"
     ports:
       - "8000:8000"
     environment:
@@ -10,7 +13,9 @@ services:
       EVENT_LOG: /data/events.jsonl
       DEMO: ${DEMO:-}                      # 1 = self-generating sample race
     volumes:
-      - pitwall-data:/data
+      # host bind mount: events.jsonl stays on disk across rebuilds and
+      # `down -v`, and tools/replay.py can read it directly
+      - ./data:/data
     networks:
       - internal
 
@@ -35,9 +40,6 @@ services:
         max-file: "3"
     networks:
       - internal
-
-volumes:
-  pitwall-data:
 
 networks:
   internal:

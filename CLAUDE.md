@@ -108,6 +108,27 @@ Invariants that bugs love to violate:
   `_track_laps`; never assume monotonic laps.
 - `predict()` may mutate state (missed-pit inference after a blackout);
   that's intentional self-healing, don't "fix" it into purity casually.
+- `TRK_NOT_IN_WORLD` is NOT a pit signal. It means two unrelated things: a
+  car being towed, and a car that is simply not in the session — in the
+  garage, not yet joined, disconnected. iRacing reports `CarIdxLap == -1` for
+  the latter, so the tow branch requires `lap > 0`, and `EXITING → RACING`
+  requires the car to be back in the world. Without both, a car parked in its
+  garage cycles the whole state machine at ~1 Hz, emitting a phantom stop per
+  pass and re-anchoring fuel a lap lower each time. This emptied a 96 L tank
+  in 30 seconds and is what actually ruined the first live race (2026-08-29):
+  12,248 phantom stops on one car, 20 of 60 cars carrying `last_pit_lap = -1`
+  into the green.
+- `last_pit_lap` is never negative. `current_lap - (-1)` silently bills every
+  later estimate for an extra lap of burn, for the rest of the race.
+- A car that has not completed a lap has not pitted, it has STARTED. Every
+  car begins the race parked in its pit stall, so the state machine walks
+  RACING → ENTERING → IN_STALL → EXITING before the green flag; `_close_stint`
+  suppresses that (no event, no anchor, stint 1 and its full tank intact).
+  The check reads `current_lap`, which only a frame ever writes — never the
+  restorable counters, which a practice snapshot repopulates.
+- `last_pit_lap > current_lap` is incoherent, not something to clamp with
+  `max(0, ...)`: the anchor is numbered against a lap count the car no longer
+  has. Fall back to the no-anchor estimate and set `anchor_uncertain`.
 
 ## Team races: identity and client placement
 
@@ -136,9 +157,13 @@ Invariants that bugs love to violate:
 ## Crash / restart recovery
 
 `--state drivers.json` snapshots full anchors (atomic tmp+rename) every
-second, keyed by cust_id with subsession ID + timestamp. On startup:
-same subsession + <6 h old → full restore; otherwise burn factors only
-(confidence capped 0.5). After long blackouts, missed-pit inference
+second, keyed by cust_id with subsession ID + **session number** + timestamp.
+On startup: same subsession AND same session number, <6 h old → full restore;
+otherwise burn factors only (confidence capped 0.5). The session number is
+not optional bookkeeping — SubSessionID alone spans practice, qualifying and
+the race, so matching on it restored practice stint anchors into the race and
+every car began on a lap count that no longer existed (`_is_same_session`).
+A snapshot without the field predates the check and warm-starts factors only. After long blackouts, missed-pit inference
 re-anchors cars that pitted unseen; `anchor_uncertain` widens bands until
 their next observed stop clears it.
 
@@ -175,8 +200,12 @@ for the player's own car model.
 ## Commands
 
 ```bash
-# engine has no test framework yet — tests were run as inline scripts.
-# If adding tests, use pytest under tests/ and mirror the scenarios below.
+# engine tests (pytest, stdlib-only engine + a synthetic-telemetry harness)
+pytest tests/
+
+# score a recorded race: predicted vs actual pit laps, pre-green stops,
+# anchors that moved without a stop. Works off the relay's events.jsonl.
+python tools/replay.py relay/data/events.jsonl
 
 # client, simulated session (no iRacing needed) -- runs the REAL engine
 # against synthetic telemetry. Use this to test prediction behaviour.
@@ -202,10 +231,10 @@ cd relay && cp .env.example .env && docker compose up -d --build
 
 ## Testing conventions
 
-The engine is tested by synthesizing telemetry frames — a `frame(on_pit,
-surface, lap)` dict factory driven through `process_frame` with a stepped
-`datetime`. Scenarios that MUST keep passing (re-create as pytest cases when
-adding a test suite):
+The engine is tested by synthesizing telemetry frames — `tests/harness.py`
+holds a `Sim` that owns the frame dict and a stepped `datetime`, with verbs
+(`drive_laps`, `drive_all_laps`, `pit_stop`, `drive_through`) that move cars
+through it. Scenarios that MUST keep passing:
 
 1. Full stint + 60 s stop → FUEL_AND_TYRES classification, ~correct litres,
    calibration factor in 0.9–1.2, band tightens post-stop.
@@ -245,6 +274,31 @@ adding a test suite):
     delta and drives classification instead of stall time. The refuel jump
     must never appear in `measured_burns`, and one low-burn traffic lap
     must not move the measured median.
+14. Race start, both procedures. The real one (per the team): cars idle ON
+    THE GRID, on track, up to ~90 s while it fills, then a warmup lap behind
+    the pace car — sometimes a whole lap, sometimes part of one. The other:
+    held in the pit box while the grid fills, then placed on the grid, which
+    reads as pit stall → track and completes a pit cycle. In BOTH, no
+    `PitStopEvent` may be emitted and every car must start on a full tank; a
+    genuine stop once racing must still be recorded, and the slow pace lap
+    must not enter the pace median. Only the box variant can fabricate a
+    stop, and a zero-lap stint fails `_calibrate`'s `effective_laps < 3`
+    guard, so such a car would sit on PRIOR_ONLY for the rest of the race.
+15. Grid after a restore: same as 14 but with `import_state(same_session=
+    True)` from a practice snapshot first. The guard must key on live
+    telemetry (`current_lap`), never on restored counters — a restore
+    repopulates `green_laps`/`stint_number`, and a guard that reads those is
+    answered with a session that is already over.
+16. Out of the world: a racing car goes `NOT_IN_WORLD` with `CarIdxLap == -1`
+    (garage, disconnect) and stays there. NO stop may be emitted, fuel must
+    not move, `last_pit_lap` must stay ≥ 0, and the car must resume the same
+    stint when it reappears. A genuine tow — racing car, out of world, then
+    back in its PIT STALL — must still close the stint as DAMAGE.
+17. Backwards restore gap: a snapshot restored into a session whose lap
+    counter starts lower must drop the anchor (`last_pit_lap`,
+    `last_stop_fuel_added_l`, `stint_number`) and keep only burn factors.
+    Practice, qualifying and the race share one SubSessionID, so this is the
+    normal case, not an edge case.
 
 Dashboard/relay: run relay locally, drive with `--demo --server
 http://localhost:8000 --token dev`, assert via `/api/state`. Relay
@@ -272,8 +326,9 @@ or field-less legacy payloads accepted.
   splash-vs-tyres cutoff (30 L) need validation against real logged stops.
 - Series with concurrent fuel+tyre service break the sequential stall-time
   model — make it a per-series reference flag if needed.
-- events.jsonl is collected but unanalysed: post-race backtest comparing
-  predicted vs actual pit laps should tune `burn_stddev` and EMA α.
+- `tools/replay.py` scores a recorded race (predicted vs actual pit lap,
+  pre-green stops, anchor churn). Still to do: use it on real recordings to
+  tune `burn_stddev` and EMA α.
 - Track temp / weather regression on burn rate (iRacing exposes both).
 - First stop of a deliberately underfuelled COMPETITOR is unpredictable by
   design; everything self-corrects at that stop. (Our own car no longer has

@@ -1,5 +1,7 @@
 # WIP PitWall -- iRacing GT3 pit stop predictor
 
+[![tests](https://github.com/MartijnStraatman/iracing-pitpredictor/actions/workflows/tests.yml/badge.svg)](https://github.com/MartijnStraatman/iracing-pitpredictor/actions/workflows/tests.yml)
+
 Predicts when every car in the field will pit by inferring competitor fuel
 state from stint lengths and pit stall durations, and shares the live
 predictions with your team via a web dashboard.
@@ -131,8 +133,12 @@ Dashboard: http://<server>:8000/?key=<VIEW_TOKEN>
 To check the deployment before race day, start it with DEMO=1 in .env --
 the relay generates a sample race itself, so the dashboard is live without
 any iRacing client connected. Unset DEMO for real use.
-Ingested events append to the pitwall-data volume (/data/events.jsonl)
-for post-race analysis. For HTTPS put Caddy in front:
+Ingested events append to relay/data/events.jsonl on the host (bind-mounted
+at /data in the container) for post-race analysis -- feed it straight to
+tools/replay.py. The container writes as ${PUID:-1000}:${PGID:-1000}, so if
+your deploy user is not uid 1000, set PUID/PGID in .env to match; otherwise
+the append fails silently and the race is not recorded. For HTTPS put Caddy
+in front:
     your.domain { reverse_proxy pitwall:8000 }
 
 ## Client (iRacing PC)
